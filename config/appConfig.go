@@ -1,14 +1,16 @@
 package config
 
 import (
-	"github.com/joho/godotenv"
 	"log"
 	"os"
+
+	"github.com/joho/godotenv"
 )
 
 type AppConfig struct {
 	ServerPort string
-	DBUrl      string
+	Dns        string
+	AppSecret  string
 }
 
 func LoadConfig() AppConfig {
@@ -16,9 +18,9 @@ func LoadConfig() AppConfig {
 	if err != nil {
 		log.Println("Không tìm thấy file .env, sẽ sử dụng biến môi trường hệ thống")
 	}
-
 	return AppConfig{
 		ServerPort: os.Getenv("PORT"),
-		DBUrl:      os.Getenv("DB_URL"),
+		Dns:        os.Getenv("DNS"),
+		AppSecret:  os.Getenv("APP_SECRET"),
 	}
 }

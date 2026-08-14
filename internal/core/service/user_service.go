@@ -1,31 +1,82 @@
 package service
 
 import (
+	"ecomerce-service/config"
 	"ecomerce-service/internal/core/domain"
 	"ecomerce-service/internal/dto"
-	"log"
+	"ecomerce-service/pkg/utils"
+	"errors"
 )
 
 type UserService struct {
+	repo   domain.UserRepository
+	config config.AppConfig
+}
+
+func NewUserService(repo domain.UserRepository, cfg config.AppConfig) *UserService {
+	return &UserService{
+		repo:   repo,
+		config: cfg,
+	}
 }
 
 func (s UserService) Signup(input dto.UserSignup) (string, error) {
+	// 1. Kiểm tra email đã tồn tại chưa
+	existingUser, _ := s.repo.FindUserByEmail(input.Email)
+	if existingUser != nil {
+		return "", errors.New("email đã được sử dụng")
+	}
 
-	log.Println(input)
+	// 2. Mã hóa mật khẩu
+	hashedPassword, err := utils.HashPassword(input.Password)
+	if err != nil {
+		return "", err
+	}
 
-	// call db to create user
-	return "this-is-my-token-as-of-now", nil
+	// 3. Tạo User mới
+	user := &domain.User{
+		Email:    input.Email,
+		Password: hashedPassword,
+		Phone:    input.Phone,
+	}
+
+	err = s.repo.CreateUser(user)
+	if err != nil {
+		return "", err
+	}
+
+	// 4. Tạo JWT Token
+	token, err := utils.GenerateToken(user.ID, s.config.AppSecret)
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
 }
 
 func (s UserService) findUserByEmail(email string) (*domain.User, error) {
-	//perform some db operation
-	//business logic
-	return nil, nil
+	return s.repo.FindUserByEmail(email)
 }
 
-func (s UserService) Login(input any) (string, error) {
+func (s UserService) Login(input dto.UserLogin) (string, error) {
+	// 1. Tìm user bằng email
+	user, err := s.repo.FindUserByEmail(input.Email)
+	if err != nil {
+		return "", errors.New("tài khoản không tồn tại")
+	}
 
-	return "", nil
+	// 2. Kiểm tra mật khẩu
+	if !utils.CheckPasswordHash(input.Password, user.Password) {
+		return "", errors.New("mật khẩu không chính xác")
+	}
+
+	// 3. Tạo JWT Token
+	token, err := utils.GenerateToken(user.ID, s.config.AppSecret)
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
 }
 
 func (s UserService) GetVerificationCode(e domain.User) (int, error) {

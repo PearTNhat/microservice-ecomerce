@@ -1,0 +1,18 @@
+### Đăng ký tài khoản mới (Register)
+POST http://localhost:8080/register
+Content-Type: application/json
+
+{
+  "email": "test@gmail.com",
+  "password": "123",
+  "phone": "0987654321"
+}
+
+### Đăng nhập (Login)
+POST http://localhost:8080/login
+Content-Type: application/json
+
+{
+  "email": "test@gmail.com",
+  "password": "123"
+}

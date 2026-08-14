@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package pb;
+
+// Cấu hình package sinh ra trong Golang
+option go_package = "ecomerce-service/internal/api/grpc/pb";
+
+// Service định nghĩa các hàm RPC
+service UserService {
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+    rpc Login(LoginRequest) returns (LoginResponse);
+}
+
+// ========================
+// MESSAGE DÀNH CHO REGISTER
+// ========================
+message RegisterRequest {
+    string email = 1;
+    string password = 2;
+    string phone = 3;
+}
+
+message RegisterResponse {
+    string token = 1;
+}
+
+// ========================
+// MESSAGE DÀNH CHO LOGIN
+// ========================
+message LoginRequest {
+    string email = 1;
+    string password = 2;
+}
+
+message LoginResponse {
+    string token = 1;
+}

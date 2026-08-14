@@ -9,12 +9,11 @@ import (
 )
 
 type UserHandler struct {
-	svc service.UserService
+	svc *service.UserService
 }
 
-func SetupUserRoutes(rh *rest.RestHandler) {
+func SetupUserRoutes(rh *rest.RestHandler, svc *service.UserService) {
 	app := rh.App
-	svc := service.UserService{}
 	handler := UserHandler{
 		svc: svc,
 	}
@@ -26,6 +25,7 @@ func SetupUserRoutes(rh *rest.RestHandler) {
 
 func (h *UserHandler) Register(ctx *fiber.Ctx) error {
 	user := dto.UserSignup{}
+
 	err := ctx.BodyParser(&user)
 	if err != nil {
 		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
@@ -41,12 +41,28 @@ func (h *UserHandler) Register(ctx *fiber.Ctx) error {
 	}
 
 	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
-		"message": token,
+		"token": token,
 	})
 }
 
 func (h *UserHandler) Login(ctx *fiber.Ctx) error {
+	loginReq := dto.UserLogin{}
+
+	err := ctx.BodyParser(&loginReq)
+	if err != nil {
+		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
+			"message": "please provide valid inputs",
+		})
+	}
+
+	token, err := h.svc.Login(loginReq)
+	if err != nil {
+		return ctx.Status(http.StatusUnauthorized).JSON(&fiber.Map{
+			"message": err.Error(),
+		})
+	}
+
 	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
-		"message": "login",
+		"token": token,
 	})
 }
