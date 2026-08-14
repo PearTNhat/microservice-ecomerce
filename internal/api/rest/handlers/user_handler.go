@@ -21,6 +21,7 @@ func SetupUserRoutes(rh *rest.RestHandler, svc *service.UserService) {
 	// Public endpoints
 	app.Post("/register", handler.Register)
 	app.Post("/login", handler.Login)
+	app.Post("/verify-email", handler.VerifyEmail)
 }
 
 func (h *UserHandler) Register(ctx *fiber.Ctx) error {
@@ -33,10 +34,34 @@ func (h *UserHandler) Register(ctx *fiber.Ctx) error {
 		})
 	}
 
-	token, err := h.svc.Signup(user)
+	msg, err := h.svc.Signup(user)
 	if err != nil {
 		return ctx.Status(http.StatusInternalServerError).JSON(&fiber.Map{
-			"message": "error on signup",
+			"message": err.Error(),
+		})
+	}
+
+	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
+		"message": msg,
+	})
+}
+
+func (h *UserHandler) VerifyEmail(ctx *fiber.Ctx) error {
+	var req struct {
+		Email string `json:"email"`
+		Code  int    `json:"code"`
+	}
+
+	if err := ctx.BodyParser(&req); err != nil {
+		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
+			"message": "please provide valid inputs",
+		})
+	}
+
+	token, err := h.svc.VerifyEmail(req.Email, req.Code)
+	if err != nil {
+		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
+			"message": err.Error(),
 		})
 	}
 

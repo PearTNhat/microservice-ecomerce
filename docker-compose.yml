@@ -16,24 +16,24 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   # 2. Redis - Cache / Message Broker
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: ecom-redis
-  #   restart: always
-  #   ports:
-  #     - "6379:6379"
-  #   volumes:
-  #     - redis_data:/data
+  redis:
+    image: redis:7-alpine
+    container_name: ecom-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
 
-  # # Giao diện quản lý Redis (RedisInsight)
-  # redisinsight:
-  #   image: redis/redisinsight:latest
-  #   container_name: ecom-redisinsight
-  #   restart: always
-  #   ports:
-  #     - "5540:5540"
-  #   volumes:
-  #     - redisinsight_data:/data
+  # Giao diện quản lý Redis (RedisInsight)
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: ecom-redisinsight
+    restart: always
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight_data:/data
 
   # 3. Kafka - Message Broker (Event Streaming)
   # kafka:
