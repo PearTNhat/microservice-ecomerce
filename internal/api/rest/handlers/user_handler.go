@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"ecomerce-service/internal/api/rest"
+	"ecomerce-service/internal/api/rest/middlewares"
 	"ecomerce-service/internal/core/service"
 	"ecomerce-service/internal/dto"
 	"github.com/gofiber/fiber/v2"
@@ -18,10 +19,22 @@ func SetupUserRoutes(rh *rest.RestHandler, svc *service.UserService) {
 		svc: svc,
 	}
 
-	// Public endpoints
+	// Public endpoints (Không cần đăng nhập)
 	app.Post("/register", handler.Register)
 	app.Post("/login", handler.Login)
 	app.Post("/verify-email", handler.VerifyEmail)
+
+	// Private endpoints (Bắt buộc phải có JWT token của người mua hàng)
+	protected := app.Group("/user", middlewares.RequireAuth(rh.Config.AppSecret))
+
+	// Endpoint xem Profile cá nhân của người mua hàng
+	protected.Get("/profile", func(c *fiber.Ctx) error {
+		userID := c.Locals("userID").(string)
+		return c.JSON(fiber.Map{
+			"message": "Chào mừng bạn tới trang cá nhân người mua hàng!",
+			"userID":  userID,
+		})
+	})
 }
 
 func (h *UserHandler) Register(ctx *fiber.Ctx) error {

@@ -9,14 +9,16 @@ import (
 )
 
 type AppConfig struct {
-	ServerPort   string
-	Dns          string
-	AppSecret    string
-	RedisAddress string
-	SMTPHost     string
-	SMTPPort     int
-	SMTPUser     string
-	SMTPPass     string
+	ServerPort     string
+	Dns            string
+	AppSecret      string
+	RedisAddress   string
+	SMTPHost       string
+	SMTPPort       int
+	SMTPUser       string
+	SMTPPass       string
+	GraylogAddress string
+	Environment    string
 }
 
 func LoadConfig() AppConfig {
@@ -31,14 +33,26 @@ func LoadConfig() AppConfig {
 		fmt.Sscanf(portStr, "%d", &smtpPort)
 	}
 
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "development"
+	}
+
+	graylogAddr := os.Getenv("GRAYLOG_ADDR")
+	if graylogAddr == "" {
+		graylogAddr = "127.0.0.1:12201"
+	}
+
 	return AppConfig{
-		ServerPort:   os.Getenv("PORT"),
-		Dns:          os.Getenv("DNS"),
-		AppSecret:    os.Getenv("APP_SECRET"),
-		RedisAddress: os.Getenv("REDIS_ADDRESS"),
-		SMTPHost:     os.Getenv("SMTP_HOST"),
-		SMTPPort:     smtpPort,
-		SMTPUser:     os.Getenv("SMTP_USER"),
-		SMTPPass:     os.Getenv("SMTP_PASS"),
+		ServerPort:     os.Getenv("PORT"),
+		Dns:            os.Getenv("DNS"),
+		AppSecret:      os.Getenv("APP_SECRET"),
+		RedisAddress:   os.Getenv("REDIS_ADDRESS"),
+		SMTPHost:       os.Getenv("SMTP_HOST"),
+		SMTPPort:       smtpPort,
+		SMTPUser:       os.Getenv("SMTP_USER"),
+		SMTPPass:       os.Getenv("SMTP_PASS"),
+		GraylogAddress: graylogAddr,
+		Environment:    env,
 	}
 }

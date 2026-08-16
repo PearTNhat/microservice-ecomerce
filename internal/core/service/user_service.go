@@ -35,7 +35,6 @@ func NewUserService(repo domain.UserRepository, cfg config.AppConfig, distributo
 type PendingUser struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
-	Phone    string `json:"phone"`
 	OTP      int    `json:"otp"`
 }
 
@@ -62,7 +61,6 @@ func (s UserService) Signup(input dto.UserSignup) (string, error) {
 	pendingUser := PendingUser{
 		Email:    input.Email,
 		Password: hashedPassword,
-		Phone:    input.Phone,
 		OTP:      otpCode,
 	}
 
@@ -117,7 +115,7 @@ func (s UserService) VerifyEmail(email string, code int) (string, error) {
 	user := &domain.User{
 		Email:    pendingUser.Email,
 		Password: pendingUser.Password,
-		Phone:    pendingUser.Phone,
+		UserType: domain.RoleCustomer,
 	}
 
 	err = s.repo.CreateUser(user)
@@ -129,7 +127,7 @@ func (s UserService) VerifyEmail(email string, code int) (string, error) {
 	s.redisClient.Del(context.Background(), redisKey)
 
 	// 5. Cấp JWT Token
-	token, err := utils.GenerateToken(user.ID, s.config.AppSecret)
+	token, err := utils.GenerateTokenWithRole(user.ID, user.UserType, s.config.AppSecret)
 	if err != nil {
 		return "", err
 	}
@@ -153,8 +151,12 @@ func (s UserService) Login(input dto.UserLogin) (string, error) {
 		return "", errors.New("mật khẩu không chính xác")
 	}
 
-	// 3. Tạo JWT Token
-	token, err := utils.GenerateToken(user.ID, s.config.AppSecret)
+	// 3. Tạo JWT Token với Role
+	userRole := user.UserType
+	if userRole == "" {
+		userRole = domain.RoleCustomer
+	}
+	token, err := utils.GenerateTokenWithRole(user.ID, userRole, s.config.AppSecret)
 	if err != nil {
 		return "", err
 	}

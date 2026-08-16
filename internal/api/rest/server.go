@@ -2,8 +2,9 @@ package rest
 
 import (
 	"ecomerce-service/config"
+	"ecomerce-service/internal/api/rest/middlewares"
+	"ecomerce-service/pkg/logger"
 	"fmt"
-	"log"
 
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/driver/postgres"
@@ -16,21 +17,24 @@ type Server struct {
 	Config config.AppConfig
 }
 
-// RestHandler giữ nguyên cấu trúc cũ để không ảnh hưởng tới handlers
+// RestHandler giữ nguyên cấu trúc để truyền dependencies cho route handlers
 type RestHandler struct {
-	App *fiber.App
+	App    *fiber.App
+	Config config.AppConfig
 }
 
 func NewServer(cfg config.AppConfig) *Server {
 	// 1. Khởi tạo kết nối Database bằng GORM
 	db, err := gorm.Open(postgres.Open(cfg.Dns), &gorm.Config{})
 	if err != nil {
-		log.Fatalf("❌ Lỗi kết nối tới Database: %v", err)
+		logger.Error("❌ Lỗi kết nối tới Database", "error", err.Error())
+		panic(err)
 	}
-	log.Println("✅ Đã kết nối thành công tới Database PostgreSQL!")
+	logger.Info("✅ Đã kết nối thành công tới Database PostgreSQL!")
 
-	// 2. Khởi tạo Fiber App
+	// 2. Khởi tạo Fiber App và tích hợp RequestID Middleware
 	app := fiber.New()
+	app.Use(middlewares.RequestIDMiddleware())
 
 	server := &Server{
 		App:    app,
@@ -47,9 +51,9 @@ func (s *Server) Start() {
 		port = "8000"
 	}
 
-	log.Printf("🚀 Server đang chạy tại port %s...\n", port)
+	logger.Info("🚀 REST Server đang chạy", "port", port)
 	err := s.App.Listen(fmt.Sprintf(":%s", port))
 	if err != nil {
-		log.Fatalf("❌ Khởi động server thất bại: %v", err)
+		logger.Error("❌ Khởi động server thất bại", "error", err.Error())
 	}
 }

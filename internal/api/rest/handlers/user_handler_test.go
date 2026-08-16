@@ -2,23 +2,29 @@ package handlers
 
 import (
 	"bytes"
-	"ecomerce-service/config"
-	"ecomerce-service/internal/api/rest"
-	"ecomerce-service/internal/core/domain"
-	"ecomerce-service/internal/core/service"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http/httptest"
 	"testing"
 
+	"ecomerce-service/config"
+	"ecomerce-service/internal/api/rest"
+	"ecomerce-service/internal/core/domain"
+	"ecomerce-service/internal/core/service"
+	"ecomerce-service/internal/worker"
+
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gofiber/fiber/v2"
+	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 // ==========================================
-// 1. TẠO MỘT DATABASE GIẢ (MOCK REPOSITORY)
+// 1. TẠO MOCK REPOSITORY & MOCK TASK DISTRIBUTOR
 // ==========================================
 // Đây là kỹ thuật cực kỳ quan trọng trong Clean Architecture.
-// Thay vì kết nối Postgres thật, chúng ta tạo một DB giả lưu trên RAM.
+// Thay vì kết nối Postgres/Redis thật, chúng ta tạo mock để test độc lập.
 type mockUserRepository struct {
 	users map[string]*domain.User
 }
@@ -39,18 +45,41 @@ func (m *mockUserRepository) FindUserByEmail(email string) (*domain.User, error)
 func (m *mockUserRepository) FindUserById(id uint) (*domain.User, error) { return nil, nil }
 func (m *mockUserRepository) UpdateUser(user *domain.User) error         { return nil }
 
+type mockTaskDistributor struct{}
+
+func (m *mockTaskDistributor) DistributeTaskSendVerifyEmail(
+	ctx context.Context,
+	payload *worker.PayloadSendVerifyEmail,
+	opts ...asynq.Option,
+) error {
+	return nil
+}
+
 // ==========================================
 // 2. VIẾT UNIT TEST CHO TÍNH NĂNG ĐĂNG KÝ
 // ==========================================
 func TestRegister_Success(t *testing.T) {
+	// Khởi tạo miniredis cho môi trường test
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Không thể khởi động miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(),
+	})
+	defer redisClient.Close()
+
 	// Chuẩn bị môi trường Test
 	app := fiber.New()
 	rh := &rest.RestHandler{App: app}
 
-	// Tiêm DB giả vào Service thay vì DB thật
+	// Tiêm DB giả, Mock Task Distributor và Redis Client vào Service
 	mockRepo := &mockUserRepository{users: make(map[string]*domain.User)}
+	mockDistributor := &mockTaskDistributor{}
 	mockConfig := config.AppConfig{AppSecret: "secret-test-key"}
-	userService := service.NewUserService(mockRepo, mockConfig)
+	userService := service.NewUserService(mockRepo, mockConfig, mockDistributor, redisClient)
 
 	// Khởi tạo routes
 	SetupUserRoutes(rh, userService)
@@ -71,12 +100,12 @@ func TestRegister_Success(t *testing.T) {
 		t.Errorf("Kỳ vọng status 200 nhưng nhận được %d", resp.StatusCode)
 	}
 
-	// Đọc nội dung JSON trả về xem có chứa Token không
+	// Đọc nội dung JSON trả về xem có chứa message phản hồi không
 	body, _ := io.ReadAll(resp.Body)
 	var responseData map[string]interface{}
 	json.Unmarshal(body, &responseData)
 
-	if _, hasToken := responseData["token"]; !hasToken {
-		t.Errorf("Đăng ký thành công nhưng không thấy trả về Token! Body: %s", string(body))
+	if msg, hasMsg := responseData["message"]; !hasMsg || msg == "" {
+		t.Errorf("Đăng ký thành công nhưng không thấy trả về message xác thực! Body: %s", string(body))
 	}
 }

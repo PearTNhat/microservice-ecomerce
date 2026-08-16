@@ -29,7 +29,6 @@ func (h *UserGrpcHandler) Register(ctx context.Context, req *pb.RegisterRequest)
 			Email:    req.GetEmail(),
 			Password: req.GetPassword(),
 		},
-		Phone: req.GetPhone(),
 	}
 
 	// 2. Gọi Service cốt lõi (Tái sử dụng 100% logic đã viết cho REST)
