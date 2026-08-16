@@ -1,6 +1,15 @@
-main
-.env
-ecomerce-service/
-bin/api-gateway
-bin/product-service
-bin/user-service
+# Global OS & IDE ignores
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
+
+# Sub-repositories ignored artifacts
+backend/bin/
+backend/.env
+frontend/node_modules/
+frontend/dist/
+frontend/.next/
+frontend/.env
+frontend/.env.local
