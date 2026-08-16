@@ -19,6 +19,7 @@ type AppConfig struct {
 	SMTPPass       string
 	GraylogAddress string
 	Environment    string
+	KafkaBrokers   string
 }
 
 func LoadConfig() AppConfig {
@@ -43,6 +44,11 @@ func LoadConfig() AppConfig {
 		graylogAddr = "127.0.0.1:12201"
 	}
 
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	if kafkaBrokers == "" {
+		kafkaBrokers = "localhost:9092"
+	}
+
 	return AppConfig{
 		ServerPort:     os.Getenv("PORT"),
 		Dns:            os.Getenv("DNS"),
@@ -54,5 +60,6 @@ func LoadConfig() AppConfig {
 		SMTPPass:       os.Getenv("SMTP_PASS"),
 		GraylogAddress: graylogAddr,
 		Environment:    env,
+		KafkaBrokers:   kafkaBrokers,
 	}
 }

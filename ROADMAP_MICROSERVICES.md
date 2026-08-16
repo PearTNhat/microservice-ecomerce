@@ -7,97 +7,119 @@
 
 ## 🏛️ PHẦN 1: BẢN THIẾT KẾ KIẾN TRÚC TOÀN DIỆN
 
-Hệ thống được thiết kế theo nguyên lý **Domain-Driven Design (DDD)** gồm 3 Microservices cốt lõi, 1 API Gateway và hệ thống giám sát Log tập trung (**Graylog**):
+Hệ thống được thiết kế theo mô hình **Monorepo Microservices độc lập**, gồm **API Gateway**, **3 Core Microservices**, và **Hệ thống giám sát Graylog**:
 
 ```mermaid
 graph TB
-    Client["Web App / Mobile App / Kỹ thuật viên"] --> Gateway["API Gateway (Go Fiber) - RateLimit + TraceID + Auth"]
+    Client["Web App / Mobile App (Người Mua Hàng)"] --> Gateway["API Gateway (Go Fiber) - Port 8000"]
 
-    subgraph CoreServices["3 Cụm Microservices Cốt Lõi (Clean Architecture & gRPC)"]
-        Gateway --> S1["1. User & Identity Service"]
-        Gateway --> S2["2. Product & Catalog Service"]
-        Gateway --> S3["3. Order & Fulfillment Service"]
+    subgraph IndependentMicroservices["Các Microservices Độc Lập"]
+        Gateway -->|"Proxy: /login, /register, /user/*"| S1["1. User Service (REST: 8001 | gRPC: 50051)"]
+        Gateway -->|"Proxy: /products/*, /categories, /brands"| S2["2. Product Service (REST: 8002)"]
+        Gateway -->|"Proxy: /cart/*, /orders/*"| S3["3. Order Service (REST: 8003 | gRPC: 50053)"]
     end
 
-    subgraph ObservabilityLayer["Hệ Thống Xem & Quản Lý Log Tập Trung"]
-        S1 & S2 & S3 & Gateway -.->|"GELF / JSON Logs"| Graylog["Graylog Centralized Log UI"]
-        Graylog --> OpenSearch[("OpenSearch / Storage")]
-        Graylog --> Alert["Cảnh báo lỗi qua Telegram/Slack"]
+    subgraph ObservabilityLayer["Giám Sát & Quản Lý Log Tập Trung"]
+        S1 & S2 & S3 & Gateway -.->|"GELF UDP / JSON"| Graylog["Graylog Web UI (Port 9000)"]
+        Graylog --> OpenSearch[("OpenSearch Storage")]
     end
 
     subgraph EnterpriseInfra["Hạ Tầng Phân Tán & Message Brokers"]
-        S2 -.->|"Kafka: User Activity & View Stream"| KAFKA[("Apache Kafka (KRaft)")]
-        S3 -.->|"RabbitMQ: Saga Order Events"| RMQ[("RabbitMQ (DLX / High Reliability)")]
-        RMQ -.->|"Consume: Mail/SMS & Lịch thợ"| WORKER["Notification & Asynq Worker"]
+        S2 -.->|"Kafka: Stream lượt xem máy lạnh/tủ lạnh"| KAFKA[("Apache Kafka (KRaft)")]
+        S3 -.->|"RabbitMQ: Saga Order Events"| RMQ[("RabbitMQ (DLX)")]
+        RMQ -.->|"Consume gửi mail hóa đơn"| WORKER["Notification & Asynq Worker"]
         S1 & S2 & S3 --> REDIS[("Redis (Singleflight + Lock Flash Sale + OTP)")]
-        S1 & S2 & S3 --> PG[("PostgreSQL (JSONB Specs + Optimistic Lock)")]
+        S1 & S2 & S3 --> PG[("PostgreSQL (JSONB Specs + DB)")]
     end
 ```
 
 ---
 
-## 📊 PHẦN 2: BẢNG PHÂN VAI CÔNG NGHỆ TOÀN DIỆN
+## 📊 PHẦN 2: BẢNG MA TRẬN CÔNG NGHỆ VÀ TRÁCH NHIỆM
 
-| Công nghệ | Đảm nhận bài toán gì trong hệ thống? | Kỹ thuật Enterprise áp dụng |
-| :--- | :--- | :--- |
-| **📊 Graylog** | **Quản lý & Xem Log Tập Trung (Centralized Logging):**<br>- Thu thập log từ tất cả các service về 1 Dashboard duy nhất.<br>- Tìm kiếm log theo `trace_id`, xem stack trace khi có lỗi 500.<br>- Tự động gửi cảnh báo qua Telegram/Slack khi hệ thống có sự cố. | Chuẩn GELF (Graylog Extended Log Format), OpenSearch storage, Real-time alerting. |
-| **🔴 Redis** | 1. **Flash Sale Lock:** Trừ tồn kho tức thời bằng `DECR`.<br>2. **Cache:** Lưu thông số kỹ thuật điện máy.<br>3. **Chống Cache Stampede:** Kết hợp `singleflight`.<br>4. **Security:** Lưu mã OTP và Idempotency-Key. | In-memory atomic operations, Distributed Locking, Singleflight grouping. |
-| **🐰 RabbitMQ** | **Event-Driven điều phối đơn hàng & giao việc:**<br>- Bắn event `order.created` phân phối công việc cho worker.<br>- Định tuyến qua Topic Exchange.<br>- Dead Letter Exchange (DLX) xử lý lỗi có kiểm soát. | Publisher Confirms, Message Acknowledgment, Retry Exponential Backoff. |
-| **🦅 Apache Kafka** | **Big Data Stream & Phân tích hành vi:**<br>- Stream lượt xem, click thông số kỹ thuật máy lạnh/tủ lạnh.<br>- Xử lý real-time analytics: Top sản phẩm xem nhiều nhất trong ngày. | Partitioning, High-Throughput Log Streaming, Event Sourcing. |
-| **⚡ gRPC / Protobuf** | Giao tiếp nội bộ giữa các Service với độ trễ cực thấp (microsecond). | Binary serialization, HTTP/2 multiplexing, Strong type contract. |
-| **🌐 Go Fiber** | REST API Gateway phục vụ Web / Mobile Clients. | Zero memory allocation, Fast HTTP Engine. |
-| **🐘 PostgreSQL** | Lưu trữ dữ liệu quan hệ ACID + cột `JSONB` lưu thông số kỹ thuật linh hoạt. | Database Indexing, JSONB queries, ACID Transactions. |
+| Service / Tool | Port | Trách nhiệm chính trong hệ thống | Kỹ thuật Enterprise áp dụng |
+| :--- | :--- | :--- | :--- |
+| **🌐 API Gateway** | `8000` | - Cửa ngõ duy nhất đón nhận request từ Client.<br>- Điều hướng Reverse Proxy sang các service con. | Rate Limiter (100 req/min), Global CORS, `X-Request-ID` Trace ID. |
+| **👤 User Service** | `8001` (gRPC: `50051`) | - Đăng ký nhận OTP qua Email, kích hoạt tài khoản.<br>- Đăng nhập cấp JWT Token, xem Profile người mua hàng. | Asynq Worker, Redis OTP TTL 15m, gRPC Server. |
+| **📦 Product Service** | `8002` | - Danh mục, thương hiệu, sản phẩm điện máy.<br>- Thông số kỹ thuật động (BTU, Inverter, dung tích...). | Cache-Aside (Redis), `singleflight` chống sập DB, Kafka Producer. |
+| **🛒 Order Service** | `8003` (gRPC: `50053`) | - Giỏ hàng, Đặt hàng, Áp mã Voucher, Thanh toán.<br>- Điều phối trạng thái đơn hàng. | Redis Atomic `DECR` (Flash Sale), `Idempotency-Key`, RabbitMQ Saga. |
+| **📊 Graylog** | `9000` (GELF: `12201`) | - Quản lý và tìm kiếm log tập trung toàn hệ thống. | Chuẩn GELF UDP, OpenSearch indexing, Trace ID search. |
 
 ---
 
-## 🏢 PHẦN 3: CHI TIẾT 3 SERVICE CỐT LÕI
-
-### 1. User & Identity Service *(Đang hoàn thiện)*
-- **Trách nhiệm:** Xác thực người dùng, OTP qua Asynq, phân quyền RBAC (Khách hàng, Thợ kỹ thuật, Quản trị viên), sổ địa chỉ.
-- **Observability:** Bắn log JSON có cấu trúc kèm `trace_id` về Graylog.
-- **Enterprise Pattern:** JWT Token với cơ chế Blacklist tức thời trên Redis khi Logout/Đổi mật khẩu.
-
-### 2. Product & Catalog Service (Sản phẩm & Thông số kỹ thuật)
-- **Trách nhiệm:** Danh mục cây, thương hiệu, sản phẩm điện máy với thông số kỹ thuật động (`specifications JSONB`).
-- **Enterprise Pattern:**
-  - **Cache-Aside Pattern + Singleflight:** Dùng `golang.org/x/sync/singleflight` chống sập Cache (Cache Stampede).
-  - **Kafka Producer:** Stream toàn bộ lượt xem chi tiết máy lạnh/tủ lạnh vào Kafka topic `product-views` để phân tích sản phẩm hot.
-
-### 3. Order & Fulfillment Service (Đơn hàng, Kho Flash Sale & Lắp đặt)
-- **Trách nhiệm:** Giỏ hàng, Đơn hàng, Thanh toán, Quản lý kho Flash Sale, Lên lịch thợ lắp đặt kỹ thuật và Kích hoạt Bảo hành điện tử (E-Warranty).
-- **Enterprise Pattern:**
-  - **Redis Atomic Lock (`DECR`):** Trừ kho Flash Sale tức thì trong 1ms, loại bỏ hoàn toàn nguy cơ bán âm kho (Overselling).
-  - **Idempotency Key:** Chặn request thanh toán trùng lặp khi mạng lag.
-  - **RabbitMQ Saga Pattern:** Điều phối đơn hàng qua Topic Exchange + Dead Letter Exchange (DLX).
-
----
-
-## 🎯 PHẦN 4: LỘ TRÌNH 4 BƯỚC TRIỂN KHAI THỰC CHIẾN
+## 📍 PHẦN 3: BẢNG THEO DÕI TIẾN ĐỘ THỰC TẾ (PROGRESS STATUS)
 
 ```mermaid
 graph LR
-    B1["Bước 1: Graylog Logging & User Service"] --> B2["Bước 2: Product Service + Cache + Kafka"]
-    B2 --> B3["Bước 3: Order Service + Redis Lock + RabbitMQ"]
-    B3 --> B4["Bước 4: API Gateway & Docker Compose All-In-One"]
+    B1["✅ Bước 1: Observability & User (DONE)"] --> B2["✅ Bước 2: Product & Kafka & Gateway (DONE)"]
+    B2 --> B3["⏳ Bước 3: Order, Flash Sale & RabbitMQ (NEXT)"]
+    B3 --> B4["⏸️ Bước 4: Hoàn Thiện Toàn Diện & CV"]
 ```
 
-### 📍 Bước 1: Chuẩn hóa Graylog Observability & Core User Service
-1. Cấu hình **Graylog + OpenSearch + MongoDB** trong Docker Compose để mở giao diện web xem log.
-2. Tích hợp **Structured Logging JSON (`slog`)** và Middleware **`X-Request-ID`** bắn log về Graylog.
-3. Phân quyền RBAC: `CUSTOMER`, `TECHNICIAN`, `ADMIN`.
-4. Duy trì Unit Test với `miniredis` và Mock Repository.
+### ✅ BƯỚC 1: Observability (Graylog & Slog), Trace ID & User Service (ĐÃ HOÀN THÀNH 100%)
+- [x] Cấu hình cụm **Graylog + OpenSearch + MongoDB** trong `docker-compose.yml`.
+- [x] Xây dựng gói **Structured Logger** (`pkg/logger`) dùng `log/slog` gửi GELF UDP tới Graylog.
+- [x] Viết Middleware **`X-Request-ID`** tự động gán Trace ID và đo `latency_ms`.
+- [x] Viết Middleware **`RBAC`** kiểm tra phân quyền.
+- [x] Tinh gọn luồng **Customer / Buyer** (Đăng ký OTP $\rightarrow$ Verify Email $\rightarrow$ Login $\rightarrow$ Profile).
+- [x] Viết Unit Test và đạt 100% PASS.
 
-### 📍 Bước 2: Xây dựng Product Service + Redis Cache + Kafka Tracking
-1. Database Schema: Bảng `products` với cột `specifications (JSONB)` lưu thông số BTU, Inverter, dung tích...
-2. Tích hợp Redis Caching + `singleflight` chống sập database.
-3. Tích hợp Apache Kafka (KRaft mode) để stream và đếm lượt xem sản phẩm.
+---
 
-### 📍 Bước 3: Xây dựng Order Service + Redis Flash Sale Lock + RabbitMQ Saga
-1. Giỏ hàng & Tạo đơn hàng với `Idempotency-Key`.
-2. Module Flash Sale: Trừ kho nguyên tử bằng Redis `DECR`.
-3. Tích hợp RabbitMQ: Điều phối đơn hàng, gửi mail hóa đơn, lên lịch thợ lắp đặt kỹ thuật và kích hoạt bảo hành điện tử (E-Warranty).
+### ✅ BƯỚC 2: Product & Catalog Service, Redis Cache & Kafka Stream (ĐÃ HOÀN THÀNH 100%)
+- [x] Thiết kế Domain & DB Entity: `Category`, `Brand`, `Product` với cột `specifications (JSONB)`.
+- [x] Tạo PostgreSQL Repository hỗ trợ lọc đa chiều (`min_price`, `max_price`, danh mục, thương hiệu, từ khóa `ILIKE`).
+- [x] Tự động Seed dữ liệu mẫu thực tế về đồ điện máy (Daikin, Panasonic, Samsung, Bosch...).
+- [x] Xây dựng cơ chế **Cache-Aside Redis** kết hợp **`singleflight`** chống sập database (Cache Stampede).
+- [x] Tích hợp **Apache Kafka Producer** bắn event `ProductViewedEvent` ngầm.
+- [x] Cung cấp REST endpoints: `GET /categories`, `GET /brands`, `GET /products`, `GET /products/:id`.
+- [x] Chuyển đổi thành công kiến trúc **Monorepo Microservices** với các binary độc lập:
+  - `cmd/api-gateway/main.go` (Port 8000)
+  - `cmd/user-service/main.go` (Port 8001 & gRPC 50051)
+  - `cmd/product-service/main.go` (Port 8002)
+- [x] Viết `Makefile` tự động hóa build/run và kiểm thử đạt 100% PASS.
 
-### 📍 Bước 4: API Gateway, Docker Compose & Hoàn Thiện Hồ Sơ Phỏng Vấn
-1. Xây dựng API Gateway bằng Go Fiber: Rate Limiter, Centralized JWT Auth, Dynamic Routing.
-2. Viết file `docker-compose.yml` chạy toàn bộ hệ thống (*Graylog, OpenSearch, Postgres, Redis, RabbitMQ, Kafka, Go Services*) chỉ với 1 lệnh `docker compose up -d`.
-3. Viết tài liệu `README.md` chuyên nghiệp với sơ đồ kiến trúc và Benchmark hiệu năng.
+---
+
+### ⏳ BƯỚC 3: Order & Cart Service, Redis Flash Sale Lock & RabbitMQ (SẮP THỰC HIỆN LẦN TỚI)
+- [ ] Thiết kế Domain & Entity: `Cart`, `CartItem`, `Order`, `OrderItem`.
+- [ ] Viết API Giỏ hàng: `GET /cart`, `POST /cart/add`, `PUT /cart/update`, `DELETE /cart/remove`.
+- [ ] Áp dụng **`Idempotency-Key` Middleware** chống bấm đặt hàng / thanh toán 2 lần.
+- [ ] Xây dựng module **Flash Sale Atomic Lock với Redis (`DECR`)**: Chống bán âm kho khi hàng nghìn người cùng tranh mua.
+- [ ] Cấu hình **RabbitMQ (Topic Exchange & Dead Letter Queue - DLX)**:
+  - `Order Service` tạo đơn $\rightarrow$ Publish event `order.created`.
+  - `Worker` nhận event $\rightarrow$ Gửi email hóa đơn xác nhận đơn hàng ngầm.
+- [ ] Viết `cmd/order-service/main.go` (Port 8003) và cấu hình proxy trên `API Gateway`.
+- [ ] Viết Unit Test cho Order Service.
+
+---
+
+### ⏸️ BƯỚC 4: Hoàn Thiện Toàn Bộ Hệ Thống & Đóng Gói CV (GIAI ĐOẠN CUỐI)
+- [ ] Bật toàn bộ dịch vụ trong `docker-compose.yml` (Postgres, Redis, Kafka, RabbitMQ, Graylog, Gateway, Services).
+- [ ] Viết tài liệu `README.md` chuyên nghiệp có sơ đồ kiến trúc để đưa vào CV.
+- [ ] Benchmark hiệu năng (ab / k6) ghi lại số liệu chịu tải ấn tượng cho buổi phỏng vấn.
+
+---
+
+## 💻 HƯỚNG DẪN CHẠY HỆ THỐNG HIỆN TẠI
+
+```bash
+# 1. Khởi chạy toàn bộ hạ tầng Docker (Postgres, Redis, Graylog, OpenSearch, Mongo)
+make run-docker
+
+# 2. Chạy kiểm thử tự động toàn bộ codebase
+make test
+
+# 3. Biên dịch tất cả 3 Microservices
+make build-all
+
+# 4. Khởi chạy từng Service trên các terminal riêng:
+# Terminal 1:
+make run-user        # Chạy User Service tại :8001 (gRPC: 50051)
+
+# Terminal 2:
+make run-product     # Chạy Product Service tại :8002
+
+# Terminal 3:
+make run-gateway     # Chạy API Gateway tại :8000
+```

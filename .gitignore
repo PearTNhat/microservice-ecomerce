@@ -1,3 +1,6 @@
 main
 .env
 ecomerce-service/
+bin/api-gateway
+bin/product-service
+bin/user-service

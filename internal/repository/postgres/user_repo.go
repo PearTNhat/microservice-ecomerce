@@ -11,12 +11,6 @@ type userRepositoryImpl struct {
 }
 
 func NewUserRepository(db *gorm.DB) domain.UserRepository {
-	// Tự động tạo bảng nếu chưa có (AutoMigrate)
-	err := db.AutoMigrate(&domain.User{})
-	if err != nil {
-		panic(err)
-	}
-
 	return &userRepositoryImpl{
 		db: db,
 	}
