@@ -5,8 +5,10 @@ import (
 	"ecomerce-service/internal/api/rest/middlewares"
 	"ecomerce-service/internal/core/service"
 	"ecomerce-service/internal/dto"
-	"github.com/gofiber/fiber/v2"
+	"ecomerce-service/pkg/response"
 	"net/http"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 type UserHandler struct {
@@ -30,9 +32,8 @@ func SetupUserRoutes(rh *rest.RestHandler, svc *service.UserService) {
 	// Endpoint xem Profile cá nhân của người mua hàng
 	protected.Get("/profile", func(c *fiber.Ctx) error {
 		userID := c.Locals("userID").(string)
-		return c.JSON(fiber.Map{
-			"message": "Chào mừng bạn tới trang cá nhân người mua hàng!",
-			"userID":  userID,
+		return response.Success(c, http.StatusOK, "Chào mừng bạn tới trang cá nhân người mua hàng!", fiber.Map{
+			"userID": userID,
 		})
 	})
 }
@@ -42,21 +43,15 @@ func (h *UserHandler) Register(ctx *fiber.Ctx) error {
 
 	err := ctx.BodyParser(&user)
 	if err != nil {
-		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
-			"message": "please provide valid inputs",
-		})
+		return response.BadRequest(ctx, "Dữ liệu đăng ký không hợp lệ", "INVALID_BODY")
 	}
 
 	msg, err := h.svc.Signup(user)
 	if err != nil {
-		return ctx.Status(http.StatusInternalServerError).JSON(&fiber.Map{
-			"message": err.Error(),
-		})
+		return response.InternalError(ctx, err.Error())
 	}
 
-	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
-		"message": msg,
-	})
+	return response.Success(ctx, http.StatusOK, msg, nil)
 }
 
 func (h *UserHandler) VerifyEmail(ctx *fiber.Ctx) error {
@@ -66,19 +61,15 @@ func (h *UserHandler) VerifyEmail(ctx *fiber.Ctx) error {
 	}
 
 	if err := ctx.BodyParser(&req); err != nil {
-		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
-			"message": "please provide valid inputs",
-		})
+		return response.BadRequest(ctx, "Dữ liệu xác thực không hợp lệ", "INVALID_BODY")
 	}
 
 	token, err := h.svc.VerifyEmail(req.Email, req.Code)
 	if err != nil {
-		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
-			"message": err.Error(),
-		})
+		return response.BadRequest(ctx, err.Error(), "VERIFICATION_FAILED")
 	}
 
-	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
+	return response.Success(ctx, http.StatusOK, "Xác thực email thành công!", fiber.Map{
 		"token": token,
 	})
 }
@@ -88,19 +79,15 @@ func (h *UserHandler) Login(ctx *fiber.Ctx) error {
 
 	err := ctx.BodyParser(&loginReq)
 	if err != nil {
-		return ctx.Status(http.StatusBadRequest).JSON(&fiber.Map{
-			"message": "please provide valid inputs",
-		})
+		return response.BadRequest(ctx, "Thông tin đăng nhập không hợp lệ", "INVALID_BODY")
 	}
 
 	token, err := h.svc.Login(loginReq)
 	if err != nil {
-		return ctx.Status(http.StatusUnauthorized).JSON(&fiber.Map{
-			"message": err.Error(),
-		})
+		return response.Unauthorized(ctx, err.Error())
 	}
 
-	return ctx.Status(http.StatusOK).JSON(&fiber.Map{
+	return response.Success(ctx, http.StatusOK, "Đăng nhập thành công!", fiber.Map{
 		"token": token,
 	})
 }

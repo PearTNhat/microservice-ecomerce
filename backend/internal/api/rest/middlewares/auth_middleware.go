@@ -2,6 +2,7 @@ package middlewares
 
 import (
 	"ecomerce-service/pkg/logger"
+	"ecomerce-service/pkg/response"
 	"ecomerce-service/pkg/utils"
 	"strings"
 
@@ -14,38 +15,26 @@ func RequireAuth(secret string) fiber.Handler {
 		// 1. Lấy token từ header Authorization
 		authHeader := c.Get("Authorization")
 		if authHeader == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"status":  "error",
-				"message": "Không tìm thấy token xác thực (Missing Authorization Header)",
-			})
+			return response.Unauthorized(c, "Không tìm thấy token xác thực (Missing Authorization Header)")
 		}
 
 		// 2. Tách chữ "Bearer " ra khỏi token (định dạng: Bearer <token>)
 		parts := strings.Split(authHeader, " ")
 		if len(parts) != 2 || parts[0] != "Bearer" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"status":  "error",
-				"message": "Định dạng token không hợp lệ (Phải là 'Bearer <token>')",
-			})
+			return response.Unauthorized(c, "Định dạng token không hợp lệ (Phải là 'Bearer <token>')")
 		}
 		tokenString := parts[1]
 
 		// 3. Giải mã và xác thực token
 		claims, err := utils.VerifyToken(tokenString, secret)
 		if err != nil {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"status":  "error",
-				"message": "Token không hợp lệ hoặc đã hết hạn",
-			})
+			return response.Unauthorized(c, "Token không hợp lệ hoặc đã hết hạn")
 		}
 
 		// 4. Trích xuất userID từ claims ("sub") và role từ claims ("role")
 		userIDStr, ok := claims["sub"].(string)
 		if !ok {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"status":  "error",
-				"message": "Token không chứa thông tin User ID",
-			})
+			return response.Unauthorized(c, "Token không chứa thông tin User ID")
 		}
 
 		role, ok := claims["role"].(string)

@@ -3,7 +3,7 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: ecom-postgres
-    restart: always
+    restart: "no"
     environment:
       POSTGRES_USER: root
       POSTGRES_PASSWORD: secret
@@ -18,7 +18,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ecom-redis
-    restart: always
+    restart: "no"
     ports:
       - "6379:6379"
     volumes:
@@ -28,7 +28,7 @@ services:
   redisinsight:
     image: redis/redisinsight:latest
     container_name: ecom-redisinsight
-    restart: always
+    restart: "no"
     ports:
       - "5540:5540"
     volumes:
@@ -38,7 +38,7 @@ services:
   kafka:
     image: apache/kafka:3.7.0
     container_name: ecom-kafka
-    restart: always
+    restart: "no"
     ports:
       - "9092:9092"
     environment:
@@ -58,7 +58,7 @@ services:
   elasticsearch:
     image: elasticsearch:8.10.2
     container_name: ecom-elasticsearch
-    restart: always
+    restart: "no"
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false # Tắt SSL nội bộ để tiện dev local
@@ -72,7 +72,7 @@ services:
   mongo:
     image: mongo:6.0
     container_name: ecom-mongo
-    restart: always
+    restart: "no"
     volumes:
       - mongo_data:/data/db
 
@@ -80,7 +80,7 @@ services:
   opensearch:
     image: opensearchproject/opensearch:2.12.0
     container_name: ecom-opensearch
-    restart: always
+    restart: "no"
     environment:
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
       - "bootstrap.memory_lock=true"
@@ -104,7 +104,7 @@ services:
   graylog:
     image: graylog/graylog:6.0
     container_name: ecom-graylog
-    restart: always
+    restart: "no"
     depends_on:
       - mongo
       - opensearch
