@@ -29,3 +29,9 @@ proto:
 # Khởi động hạ tầng Docker
 run-docker:
 	docker compose up -d
+
+down-docker:
+	docker compose down
+
+stop-docker:
+	docker compose stop

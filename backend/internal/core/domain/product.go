@@ -69,5 +69,6 @@ type ProductRepository interface {
 	CreateCategory(category *Category) error
 	CreateBrand(brand *Brand) error
 	IncrementViews(id uint) error
+	BatchIncrementViews(viewCounts map[uint]int64) error
 	Count() (int64, error)
 }

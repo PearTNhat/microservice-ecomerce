@@ -42,7 +42,8 @@ func main() {
 
 	// 2. Khởi tạo Fiber Gateway App
 	app := fiber.New(fiber.Config{
-		AppName: "E-Commerce Microservices API Gateway",
+		AppName:               "E-Commerce Microservices API Gateway",
+		DisableStartupMessage: true,
 	})
 
 	// 3. Middlewares toàn cục

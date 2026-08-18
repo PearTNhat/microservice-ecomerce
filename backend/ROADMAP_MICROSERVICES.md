@@ -72,6 +72,7 @@ graph LR
 - [x] Tự động Seed dữ liệu mẫu thực tế về đồ điện máy (Daikin, Panasonic, Samsung, Bosch...).
 - [x] Xây dựng cơ chế **Cache-Aside Redis** kết hợp **`singleflight`** chống sập database (Cache Stampede).
 - [x] Tích hợp **Apache Kafka Producer** bắn event `ProductViewedEvent` ngầm.
+- [x] Xây dựng **Kafka View Consumer Worker** (`internal/worker/product_view_worker.go`): Gom batch lượt xem định kỳ 5s cập nhật vào PostgreSQL và tự động xóa Cache Redis.
 - [x] Cung cấp REST endpoints: `GET /categories`, `GET /brands`, `GET /products`, `GET /products/:id`.
 - [x] Chuyển đổi thành công kiến trúc **Monorepo Microservices** với các binary độc lập:
   - `cmd/api-gateway/main.go` (Port 8000)

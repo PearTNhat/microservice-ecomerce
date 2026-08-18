@@ -56,6 +56,7 @@ func (m *mockProductRepoForHandler) CreateProduct(product *domain.Product) error
 func (m *mockProductRepoForHandler) CreateCategory(category *domain.Category) error   { return nil }
 func (m *mockProductRepoForHandler) CreateBrand(brand *domain.Brand) error           { return nil }
 func (m *mockProductRepoForHandler) IncrementViews(id uint) error                      { return nil }
+func (m *mockProductRepoForHandler) BatchIncrementViews(viewCounts map[uint]int64) error { return nil }
 func (m *mockProductRepoForHandler) Count() (int64, error)                             { return int64(len(m.products)), nil }
 
 func setupTestProductApp(t *testing.T) (*fiber.App, *miniredis.Miniredis) {

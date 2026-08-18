@@ -33,7 +33,9 @@ func NewServer(cfg config.AppConfig) *Server {
 	logger.Info("✅ Đã kết nối thành công tới Database PostgreSQL!")
 
 	// 2. Khởi tạo Fiber App và tích hợp RequestID Middleware
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		DisableStartupMessage: true,
+	})
 	app.Use(middlewares.RequestIDMiddleware())
 
 	server := &Server{

@@ -149,6 +149,29 @@ func (r *productRepository) IncrementViews(id uint) error {
 		UpdateColumn("views", gorm.Expr("views + 1")).Error
 }
 
+func (r *productRepository) BatchIncrementViews(viewCounts map[uint]int64) error {
+	if len(viewCounts) == 0 {
+		return nil
+	}
+
+	// Cập nhật độc lập từng sản phẩm - 1 sản phẩm lỗi không làm ảnh hưởng các sản phẩm khác
+	for productID, count := range viewCounts {
+		if count <= 0 {
+			continue
+		}
+		err := r.db.Model(&domain.Product{}).Where("id = ?", productID).
+			UpdateColumn("views", gorm.Expr("views + ?", count)).Error
+		if err != nil {
+			logger.Error("❌ Lỗi tăng view cho sản phẩm trong Database",
+				"product_id", productID,
+				"views_to_add", count,
+				"error", err.Error(),
+			)
+		}
+	}
+	return nil
+}
+
 func (r *productRepository) Count() (int64, error) {
 	var count int64
 	err := r.db.Model(&domain.Product{}).Count(&count).Error

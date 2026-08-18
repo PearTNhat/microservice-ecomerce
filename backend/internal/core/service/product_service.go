@@ -82,7 +82,7 @@ func (s *ProductService) GetProducts(ctx context.Context, filterReq dto.ProductF
 }
 
 func (s *ProductService) formatPaginatedResponse(products []*domain.Product, total int64, page, limit int) *dto.PaginatedProductResponse {
-	var productItems []*dto.ProductListItemResponse
+	productItems := make([]*dto.ProductListItemResponse, 0)
 	for _, p := range products {
 		var catResp *dto.CategoryResponse
 		if p.Category != nil {

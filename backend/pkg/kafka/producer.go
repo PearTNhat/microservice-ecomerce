@@ -36,11 +36,12 @@ func NewKafkaProducer(brokers []string, topic string) EventProducer {
 	}
 
 	writer := &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        topic,
-		Balancer:     &kafka.LeastBytes{},
-		BatchTimeout: 50 * time.Millisecond,
-		Async:        true, // Bắn bất đồng bộ không chặn request
+		Addr:                   kafka.TCP(brokers...),
+		Topic:                  topic,
+		Balancer:               &kafka.LeastBytes{},
+		BatchTimeout:           50 * time.Millisecond,
+		Async:                  true, // Bắn bất đồng bộ không chặn request
+		AllowAutoTopicCreation: true, // Tự động tạo topic nếu broker cho phép
 	}
 
 	logger.Info("✅ Đã khởi tạo Kafka Producer", "topic", topic, "brokers", brokers)

@@ -50,9 +50,28 @@ services:
       KAFKA_LISTENERS: 'CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092,PLAINTEXT://0.0.0.0:29092'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       CLUSTER_ID: '4L6g3nShT-eMCtK--X86sw'
     volumes:
       - kafka_data:/var/lib/kafka/data
+
+  # 3.1 RabbitMQ - Message Broker (Hàng đợi tác vụ & định tuyến tin nhắn thông minh)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ecom-rabbitmq
+    restart: "no"
+    ports:
+      - "5672:5672"     # Cổng AMQP Protocol (Cho Go backend kết nối)
+      - "15672:15672"   # Giao diện Web Management UI (Quản lý trực quan)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
 
   # 4. Elasticsearch 8 - Tìm kiếm sản phẩm siêu tốc (Full-Text Search)
   elasticsearch:
@@ -125,6 +144,7 @@ volumes:
   redis_data:
   redisinsight_data:
   kafka_data:
+  rabbitmq_data:
   es_data:
   mongo_data:
   opensearch_data:

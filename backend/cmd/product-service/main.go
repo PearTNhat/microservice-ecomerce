@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"ecomerce-service/config"
 	"ecomerce-service/internal/api/rest"
 	"ecomerce-service/internal/api/rest/handlers"
 	"ecomerce-service/internal/core/domain"
 	"ecomerce-service/internal/core/service"
 	"ecomerce-service/internal/repository/postgres"
+	"ecomerce-service/internal/worker"
 	"ecomerce-service/pkg/elasticsearch"
 	"ecomerce-service/pkg/kafka"
 	"ecomerce-service/pkg/logger"
@@ -66,13 +68,21 @@ func main() {
 	productRepo := postgres.NewProductRepository(server.DB)
 	productService := service.NewProductService(productRepo, importRedis, kafkaProducer, esClient)
 
-	// 7. Đăng ký Product REST Routes
+	// 7. Khởi tạo và kích hoạt Kafka View Consumer Worker (Gom batch lượt xem ngầm)
+	ctx := context.Background()
+	viewWorker := worker.NewProductViewWorker([]string{appConfig.KafkaBrokers}, "product-views", productRepo, importRedis)
+	if viewWorker != nil {
+		viewWorker.Start(ctx)
+		defer viewWorker.Close()
+	}
+
+	// 8. Đăng ký Product REST Routes
 	rh := &rest.RestHandler{
 		App:    server.App,
 		Config: appConfig,
 	}
 	handlers.SetupProductRoutes(rh, productService)
 
-	// 8. Chạy REST Server ở luồng chính
+	// 9. Chạy REST Server ở luồng chính
 	server.Start()
 }

@@ -64,6 +64,7 @@ func (m *mockProductRepository) CreateProduct(product *domain.Product) error   {
 func (m *mockProductRepository) CreateCategory(category *domain.Category) error { return nil }
 func (m *mockProductRepository) CreateBrand(brand *domain.Brand) error       { return nil }
 func (m *mockProductRepository) IncrementViews(id uint) error                  { return nil }
+func (m *mockProductRepository) BatchIncrementViews(viewCounts map[uint]int64) error { return nil }
 func (m *mockProductRepository) Count() (int64, error)                         { return int64(len(m.products)), nil }
 
 func setupTestProductService(t *testing.T) (*ProductService, *miniredis.Miniredis, *mockProductRepository) {

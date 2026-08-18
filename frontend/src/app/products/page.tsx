@@ -37,14 +37,13 @@ export default async function ProductsPage({ searchParams }: ProductsPageProps) 
     productService.getBrands().catch(() => ({ data: [] })),
   ]);
 
-  const { products, total, total_pages, page } = productsRes.data || {
-    products: [],
-    total: 0,
-    total_pages: 1,
-    page: 1,
-  };
-  const categories = categoriesRes.data || [];
-  const brands = brandsRes.data || [];
+  const rawData = productsRes?.data;
+  const products = rawData?.products || [];
+  const total = rawData?.total || 0;
+  const total_pages = rawData?.total_pages || 1;
+  const page = rawData?.page || 1;
+  const categories = categoriesRes?.data || [];
+  const brands = brandsRes?.data || [];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
