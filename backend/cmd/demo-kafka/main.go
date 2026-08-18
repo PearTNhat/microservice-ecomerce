@@ -133,7 +133,7 @@ func runInteractiveProducer() {
 		} else {
 			fmt.Printf(" [PRODUCER ĐÃ BẮN] 📦 Key='%s' | Sự kiện: %s - %s\n", item.Customer, item.Action, item.Product)
 		}
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	fmt.Println("\n🎉 Đã gửi xong tất cả sự kiện!")
