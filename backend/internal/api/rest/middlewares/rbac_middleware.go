@@ -31,3 +31,7 @@ func RequireRole(allowedRoles ...string) fiber.Handler {
 		return c.Next()
 	}
 }
+
+// RequireRoles là alias cho RequireRole
+var RequireRoles = RequireRole
+

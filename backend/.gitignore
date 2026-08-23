@@ -15,4 +15,5 @@ main
 .DS_Store
 .idea/
 .vscode/
+*.code-workspace
 *.swp

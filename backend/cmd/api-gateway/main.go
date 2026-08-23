@@ -32,12 +32,18 @@ func main() {
 		productServiceURL = "http://localhost:8002"
 	}
 
+	orderServiceURL := os.Getenv("ORDER_SERVICE_URL")
+	if orderServiceURL == "" {
+		orderServiceURL = "http://localhost:8003"
+	}
+
 	// 1. Khởi tạo Structured Logger
 	logger.InitLogger("api-gateway", appConfig.Environment, appConfig.GraylogAddress)
 	logger.Info("🌐 Khởi động API Gateway (Reverse Proxy)",
 		"port", gatewayPort,
 		"user_service", userServiceURL,
 		"product_service", productServiceURL,
+		"order_service", orderServiceURL,
 	)
 
 	// 2. Khởi tạo Fiber Gateway App
@@ -49,7 +55,7 @@ func main() {
 	// 3. Middlewares toàn cục
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Request-ID",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-Idempotency-Key, Idempotency-Key",
 		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
 	}))
 
@@ -76,6 +82,7 @@ func main() {
 			"services": fiber.Map{
 				"user_service":    userServiceURL,
 				"product_service": productServiceURL,
+				"order_service":   orderServiceURL,
 			},
 		})
 	})
@@ -107,6 +114,21 @@ func main() {
 		targetRoute := route
 		app.All(targetRoute, func(c *fiber.Ctx) error {
 			targetURL := productServiceURL + c.OriginalURL()
+			return proxy.Do(c, targetURL)
+		})
+	}
+
+	// 7. REVERSE PROXY ROUTING: Chuyển tiếp tới Order Microservice (Port 8003)
+	orderRoutes := []string{
+		"/cart",
+		"/cart/*",
+		"/orders",
+		"/orders/*",
+	}
+	for _, route := range orderRoutes {
+		targetRoute := route
+		app.All(targetRoute, func(c *fiber.Ctx) error {
+			targetURL := orderServiceURL + c.OriginalURL()
 			return proxy.Do(c, targetURL)
 		})
 	}

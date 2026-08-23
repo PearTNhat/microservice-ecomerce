@@ -24,6 +24,7 @@ type AppConfig struct {
 	Environment          string
 	KafkaBrokers         string
 	ElasticsearchAddress string
+	RabbitMQURL          string
 }
 
 func LoadConfig() AppConfig {
@@ -56,6 +57,11 @@ func LoadConfig() AppConfig {
 	esAddr := os.Getenv("ELASTICSEARCH_ADDR")
 	if esAddr == "" {
 		esAddr = "http://localhost:9200"
+	}
+
+	rabbitmqURL := os.Getenv("RABBITMQ_URL")
+	if rabbitmqURL == "" {
+		rabbitmqURL = "amqp://guest:guest@localhost:5672/"
 	}
 
 	// Database per service default DNS
@@ -95,5 +101,6 @@ func LoadConfig() AppConfig {
 		Environment:          env,
 		KafkaBrokers:         kafkaBrokers,
 		ElasticsearchAddress: esAddr,
+		RabbitMQURL:          rabbitmqURL,
 	}
 }

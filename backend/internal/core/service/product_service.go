@@ -212,9 +212,6 @@ func (s *ProductService) GetProductDetail(ctx context.Context, id uint, userID s
 			}
 		}
 
-		// Tăng lượt view trong DB
-		go s.repo.IncrementViews(id)
-
 		return detail, nil
 	})
 

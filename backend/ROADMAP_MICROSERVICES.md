@@ -52,8 +52,9 @@ graph TB
 ```mermaid
 graph LR
     B1["✅ Bước 1: Observability & User (DONE)"] --> B2["✅ Bước 2: Product & Kafka & Gateway (DONE)"]
-    B2 --> B3["⏳ Bước 3: Order, Flash Sale & RabbitMQ (NEXT)"]
-    B3 --> B4["⏸️ Bước 4: Hoàn Thiện Toàn Diện & CV"]
+    B2 --> B3["✅ Bước 3: Order, Cart & Basic Lock (DONE)"]
+    B3 --> B31["⏳ Bước 3.1: Flash Sale Peak Clipping (PLANNED)"]
+    B31 --> B4["⏸️ Bước 4: Hoàn Thiện Toàn Diện & CV"]
 ```
 
 ### ✅ BƯỚC 1: Observability (Graylog & Slog), Trace ID & User Service (ĐÃ HOÀN THÀNH 100%)
@@ -82,16 +83,86 @@ graph LR
 
 ---
 
-### ⏳ BƯỚC 3: Order & Cart Service, Redis Flash Sale Lock & RabbitMQ (SẮP THỰC HIỆN LẦN TỚI)
-- [ ] Thiết kế Domain & Entity: `Cart`, `CartItem`, `Order`, `OrderItem`.
-- [ ] Viết API Giỏ hàng: `GET /cart`, `POST /cart/add`, `PUT /cart/update`, `DELETE /cart/remove`.
-- [ ] Áp dụng **`Idempotency-Key` Middleware** chống bấm đặt hàng / thanh toán 2 lần.
-- [ ] Xây dựng module **Flash Sale Atomic Lock với Redis (`DECR`)**: Chống bán âm kho khi hàng nghìn người cùng tranh mua.
-- [ ] Cấu hình **RabbitMQ (Topic Exchange & Dead Letter Queue - DLX)**:
+### ✅ BƯỚC 3: Order & Cart Service, Redis Flash Sale Lock & RabbitMQ (ĐÃ HOÀN THÀNH CƠ BẢN)
+- [x] Thiết kế Domain & Entity: `Cart`, `CartItem`, `Order`, `OrderItem`.
+- [x] Viết API Giỏ hàng: `GET /cart`, `POST /cart/add`, `PUT /cart/items/:id`, `DELETE /cart/items/:id`, `DELETE /cart`.
+- [x] Áp dụng **`Idempotency-Key` Middleware** chống bấm đặt hàng / thanh toán 2 lần bằng Redis `SETNX`.
+- [x] Xây dựng module **Flash Sale Atomic Lock với Redis (`DECR` / Lua Script)**: Chống bán âm kho khi hàng nghìn người cùng tranh mua.
+- [x] Cấu hình **RabbitMQ (Topic Exchange & Dead Letter Queue - DLX)**:
   - `Order Service` tạo đơn $\rightarrow$ Publish event `order.created`.
   - `Worker` nhận event $\rightarrow$ Gửi email hóa đơn xác nhận đơn hàng ngầm.
-- [ ] Viết `cmd/order-service/main.go` (Port 8003) và cấu hình proxy trên `API Gateway`.
-- [ ] Viết Unit Test cho Order Service.
+- [x] Viết `cmd/order-service/main.go` (Port 8003) và cấu hình proxy trên `API Gateway` (Port 8000).
+- [x] Viết Unit Test cho Order Service & Middlewares đạt 100% PASS.
+
+---
+
+### ⚡ BƯỚC 3.1: Nâng Cấp Kiến Trúc Flash Sale High-Concurrency Chống Sập Hệ Thống (LỘ TRÌNH THỰC THI)
+
+> **Mục tiêu:** Đảm bảo hệ thống chịu được **50.000 - 100.000+ QPS** trong các chiến dịch Flash Sale mà **Database PostgreSQL và Gateway hoàn toàn KHÔNG THỂ BỊ SẬP**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Người Mua Hàng
+    participant Gateway as API Gateway (Rate Limit + AntiBot)
+    participant Redis as Redis Cluster (Stock Lock + Status)
+    participant Queue as RabbitMQ (flashsale.orders.queue)
+    participant Worker as FlashSaleOrderWorker
+    participant DB as PostgreSQL (ecom_order_db)
+
+    Note over User,Gateway: 1. TIẾP NHẬN & TRỪ KHO SIÊU TỐC TRÊN RAM (< 5ms)
+    User->>Gateway: POST /orders/flash-sale (ProductID, Customer Info)
+    Gateway->>Gateway: Kiểm tra Rate Limit & Idempotency Key
+    Gateway->>Redis: Chạy Lua Script (Trừ tồn kho Atomic + Check 1 user/1 món)
+    
+    alt Hết hàng (Stock <= 0)
+        Redis-->>Gateway: Trả về 0 (Out of stock)
+        Gateway-->>User: 400 Bad Request ("Sản phẩm đã hết hàng hoặc không đủ tồn kho")
+    else Trừ kho thành công (Còn hàng)
+        Redis-->>Gateway: Trả về 1 (Thành công)
+        Gateway->>Redis: Set Key "flash_sale:order:<token>" = {"status": "PENDING"} (TTL 10m)
+        Gateway->>Queue: Bắn Task tạo đơn vào RabbitMQ "flashsale.orders.queue"
+        Gateway-->>User: 202 Accepted {"order_token": "FSO-xxx", "status": "PENDING", "message": "Đang xếp hàng tạo đơn"}
+    end
+
+    Note over Queue,DB: 2. CẮT ĐỈNH TẢI (PEAK CLIPPING) & GHI DB TỪ TỪ
+    Queue->>Worker: Consume Order Task (Prefetch kiểm soát 20-50 msg/lần)
+    Worker->>DB: INSERT INTO orders & order_items (An toàn tuyệt đối cho Connection Pool)
+    
+    alt Ghi Database Thành Công
+        Worker->>Redis: Cập nhật "flash_sale:order:<token>" = {"status": "SUCCESS", "order_id": 123}
+        Worker->>Queue: Ack & Publish event "order.created" gửi email
+    else Lỗi DB nghiêm trọng
+        Worker->>Redis: Hoàn lại kho (RevertStockAtomic)
+        Worker->>Redis: Cập nhật "flash_sale:order:<token>" = {"status": "FAILED", "reason": "..."}
+        Worker->>Queue: Ack / Đẩy vào Dead Letter Queue (DLQ)
+    end
+
+    Note over User,Redis: 3. POLLING TRẠNG THÁI (ZERO DB HIT)
+    loop Polling mỗi 1-2s
+        User->>Gateway: GET /orders/flash-sale/status/:token
+        Gateway->>Redis: Đọc trực tiếp từ RAM Redis (Không query Postgres)
+        Redis-->>User: {"status": "SUCCESS", "order_id": 123, "order_code": "ORD-xxx"}
+    end
+```
+
+#### 📋 Danh sách Task Cần Thực Thi:
+- [ ] **1. Quản lý Tồn kho & Nạp trước (Stock Pre-warming):**
+  - Viết helper / endpoint `POST /orders/flash-sale/prewarm` cho phép Admin nạp trước số lượng sản phẩm lên key Redis `product:stock:<id>` trước giờ G.
+  - Bổ sung cơ chế Rollback an toàn đa món (`RevertStockAtomic`) nếu giỏ hàng bị lỗi giữa chừng.
+- [ ] **2. Kênh Message Queue Cắt Đỉnh Tải (RabbitMQ Flash Sale):**
+  - Khai báo Exchange `ecom.flashsale.topic`, Queue `flashsale.orders.queue`, Routing key `flashsale.order.create` trong [producer.go](file:///home/nhat/Workspace/microserice-ecomerce/backend/pkg/rabbitmq/producer.go).
+  - Bổ sung struct `FlashSaleOrderTaskPayload` và hàm `PublishFlashSaleOrderTask()`.
+- [ ] **3. Order Service - Luồng Bất Đồng Bộ (Async Flash Sale):**
+  - Thêm phương thức `CreateFlashSaleOrderAsync()`: Trừ kho trên Redis $\rightarrow$ Lưu trạng thái `PENDING` $\rightarrow$ Đẩy task vào RabbitMQ $\rightarrow$ Trả về mã Token `FSO-...` (HTTP 202 Accepted).
+  - Thêm phương thức `GetFlashSaleOrderStatus()`: Đọc kết quả tạo đơn trực tiếp từ RAM Redis (Zero DB Hit).
+- [ ] **4. Flash Sale Order Worker (`internal/worker/flash_sale_worker.go`):**
+  - Lắng nghe `flashsale.orders.queue` với `Qos(20)`.
+  - Ghi đơn hàng vào PostgreSQL một cách ổn định, tự động hoàn trả kho Redis nếu DB lỗi và cập nhật trạng thái `SUCCESS` / `FAILED`.
+- [ ] **5. REST Endpoints & Gateway Routing:**
+  - `POST /orders/flash-sale` (Đặt hàng Flash Sale bất đồng bộ).
+  - `GET /orders/flash-sale/status/:token` (Kiểm tra tiến độ đơn hàng).
+  - `POST /orders/flash-sale/prewarm` (Nạp trước kho - Admin).
 
 ---
 

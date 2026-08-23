@@ -1,4 +1,4 @@
-.PHONY: proto test build-all run-gateway run-user run-product run-docker
+.PHONY: proto test build-all run-gateway run-user run-product run-order run-docker
 
 # Chạy từng Microservice độc lập
 run-gateway:
@@ -10,6 +10,9 @@ run-user:
 run-product:
 	go run cmd/product-service/main.go
 
+run-order:
+	go run cmd/order-service/main.go
+
 # Chạy kiểm thử tự động
 test:
 	go test -v ./...
@@ -20,7 +23,8 @@ build-all:
 	go build -o bin/api-gateway ./cmd/api-gateway
 	go build -o bin/user-service ./cmd/user-service
 	go build -o bin/product-service ./cmd/product-service
-	@echo "✅ Đã build thành công 3 Microservices vào thư mục bin/!"
+	go build -o bin/order-service ./cmd/order-service
+	@echo "✅ Đã build thành công 4 Microservices vào thư mục bin/!"
 
 # Sinh mã Protobuf cho gRPC
 proto:
