@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"log"
 	"os"
 
 	"github.com/joho/godotenv"
@@ -28,9 +27,11 @@ type AppConfig struct {
 }
 
 func LoadConfig() AppConfig {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Không tìm thấy file .env, sẽ sử dụng biến môi trường hệ thống")
+	envFiles := []string{".env", "../.env", "../../.env"}
+	for _, f := range envFiles {
+		if err := godotenv.Load(f); err == nil {
+			break
+		}
 	}
 
 	// Đổi SMTPPort từ string sang int

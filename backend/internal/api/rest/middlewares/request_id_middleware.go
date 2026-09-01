@@ -19,6 +19,7 @@ func RequestIDMiddleware() fiber.Handler {
 		reqID := c.Get(HeaderXRequestID)
 		if reqID == "" {
 			reqID = uuid.New().String()
+			c.Request().Header.Set(HeaderXRequestID, reqID)
 		}
 
 		// 2. Gán Request-ID vào context của Fiber và context chuẩn của Go

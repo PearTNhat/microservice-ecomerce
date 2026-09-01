@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -32,10 +33,15 @@ func NewServer(cfg config.AppConfig) *Server {
 	}
 	logger.Info("✅ Đã kết nối thành công tới Database PostgreSQL!")
 
-	// 2. Khởi tạo Fiber App và tích hợp RequestID Middleware
+	// 2. Khởi tạo Fiber App và tích hợp CORS & RequestID Middleware
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 	})
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-Idempotency-Key, Idempotency-Key",
+		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
+	}))
 	app.Use(middlewares.RequestIDMiddleware())
 
 	server := &Server{

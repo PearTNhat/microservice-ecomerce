@@ -1,4 +1,8 @@
-.PHONY: proto test build-all run-gateway run-user run-product run-order run-docker
+.PHONY: proto test build-all run-all run-gateway run-user run-product run-order run-docker
+
+# Chạy toàn bộ 4 Microservices và Frontend cùng lúc (kèm log màu)
+run-all:
+	./start_all.sh
 
 # Chạy từng Microservice độc lập
 run-gateway:
@@ -16,6 +20,9 @@ run-order:
 # Chạy kiểm thử tự động
 test:
 	go test -v ./...
+
+test-e2e:
+	./test_e2e_order.sh
 
 # Biên dịch tất cả binaries
 build-all:

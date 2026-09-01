@@ -230,7 +230,7 @@ func runDedicatedProducer() {
 			fmt.Printf(" [PRODUCER ĐÃ GỬI] 📦 [%d/%d] Đơn: %s | RoutingKey='%s' | Sản phẩm: %s\n",
 				i+1, len(orders), item.Event.OrderID, item.RoutingKey, item.Event.Product)
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	fmt.Println("\n🎉 Đã gửi xong tất cả đơn hàng vào RabbitMQ!")

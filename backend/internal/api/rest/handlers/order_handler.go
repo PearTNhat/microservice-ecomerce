@@ -26,6 +26,8 @@ func SetupOrderRoutes(rh *rest.RestHandler, svc service.OrderService, redisClien
 
 	orderGroup := app.Group("/orders", authMiddleware)
 	orderGroup.Post("/", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
+	orderGroup.Post("/checkout", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
+	orderGroup.Post("/direct", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
 	orderGroup.Get("/", handler.GetUserOrders)
 	orderGroup.Get("/:id", handler.GetOrderByID)
 	orderGroup.Put("/:id/status", middlewares.RequireRole(domain.RoleAdmin, domain.RoleTechnician), handler.UpdateOrderStatus)

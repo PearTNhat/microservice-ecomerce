@@ -26,6 +26,7 @@ export function LoginForm() {
         // Lưu token và thông tin user
         localStorage.setItem("access_token", res.data.token);
         localStorage.setItem("user_info", JSON.stringify(res.data.user));
+        window.dispatchEvent(new Event("auth-changed"));
         router.push("/");
         router.refresh();
       }

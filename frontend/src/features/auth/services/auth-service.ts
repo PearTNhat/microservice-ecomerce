@@ -13,7 +13,10 @@ export const authService = {
   async verifyEmail(data: VerifyOtpInput): Promise<ApiResponse<{ message: string }>> {
     return apiClient<ApiResponse<{ message: string }>>("/verify-email", {
       method: "POST",
-      body: JSON.stringify(data),
+      body: JSON.stringify({
+        email: data.email,
+        code: parseInt(data.code, 10),
+      }),
     });
   },
 

@@ -7,4 +7,7 @@ type UserLogin struct {
 
 type UserSignup struct {
 	UserLogin
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Phone     string `json:"phone"`
 }

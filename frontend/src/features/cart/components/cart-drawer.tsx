@@ -5,9 +5,11 @@ import { formatPrice } from "@/lib/utils";
 import { Minus, Plus, ShoppingBag, Trash2, X } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCartStore } from "../store/useCartStore";
 
 export function CartDrawer() {
+  const router = useRouter();
   const { items, isOpen, closeCart, updateQuantity, removeItem, getTotalPrice, getTotalItems } =
     useCartStore();
 
@@ -140,7 +142,8 @@ export function CartDrawer() {
                 className="w-full shadow-lg shadow-blue-500/25"
                 size="lg"
                 onClick={() => {
-                  alert("Tính năng Đặt Hàng & Thanh Toán sẽ được xử lý ở Bước 3!");
+                  closeCart();
+                  router.push("/checkout");
                 }}
               >
                 Tiến hành Đặt Hàng

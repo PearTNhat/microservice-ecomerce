@@ -24,10 +24,17 @@ export function VerifyEmailForm() {
     setError(null);
 
     try {
-      await authService.verifyEmail({ email, code });
+      const res: any = await authService.verifyEmail({ email, code });
+      if (res?.data?.token) {
+        localStorage.setItem("access_token", res.data.token);
+        if (res.data.user) {
+          localStorage.setItem("user_info", JSON.stringify(res.data.user));
+        }
+        window.dispatchEvent(new Event("auth-changed"));
+      }
       setSuccess(true);
       setTimeout(() => {
-        router.push("/login");
+        router.push("/");
       }, 1500);
     } catch (err: any) {
       setError(err.message || "Mã OTP không chính xác hoặc đã hết hạn (15 phút).");

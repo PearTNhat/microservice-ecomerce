@@ -25,14 +25,14 @@ services:
       - redis_data:/data
 
   # Giao diện quản lý Redis (RedisInsight)
-  redisinsight:
-    image: redis/redisinsight:latest
-    container_name: ecom-redisinsight
-    restart: "no"
-    ports:
-      - "5540:5540"
-    volumes:
-      - redisinsight_data:/data
+  # redisinsight:
+  #   image: redis/redisinsight:latest
+  #   container_name: ecom-redisinsight
+  #   restart: "no"
+  #   ports:
+  #     - "5540:5540"
+  #   volumes:
+  #     - redisinsight_data:/data
 
   # 3. Apache Kafka - Event Streaming (KRaft mode siêu nhẹ, không cần Zookeeper)
   kafka:
@@ -132,9 +132,11 @@ services:
       - opensearch
     environment:
       GRAYLOG_PASSWORD_SECRET: "somepasswordsecretmustbeatleast16characterslong"
-      GRAYLOG_ROOT_PASSWORD_SHA2: "d829141973cf6ff236e71ef3b58498fe641321d255d64ff1b4e06263595cf0d0"
+      GRAYLOG_ROOT_PASSWORD_SHA2: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
       GRAYLOG_HTTP_BIND_ADDRESS: "0.0.0.0:9000"
       GRAYLOG_ROOT_TIMEZONE: "Asia/Ho_Chi_Minh"
+      GRAYLOG_ELASTICSEARCH_HOSTS: "http://opensearch:9200"
+      GRAYLOG_MONGODB_URI: "mongodb://mongo:27017/graylog"
     ports:
       - "9000:9000"    # Graylog Web Interface & REST API
       - "12201:12201/udp" # GELF UDP Port nhận log từ Go Services

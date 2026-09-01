@@ -51,7 +51,7 @@ func (h *UserGrpcHandler) Login(ctx context.Context, req *pb.LoginRequest) (*pb.
 	}
 
 	// 2. Gọi Service cốt lõi
-	token, err := h.svc.Login(input)
+	token, _, err := h.svc.Login(input)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "Đăng nhập thất bại: %v", err)
 	}

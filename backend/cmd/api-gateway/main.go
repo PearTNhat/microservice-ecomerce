@@ -87,6 +87,34 @@ func main() {
 		})
 	})
 
+	// Helper function proxy an toàn, hỗ trợ preflight CORS và giữ CORS headers sau khi upstream trả về
+	proxyTo := func(baseURL string) fiber.Handler {
+		return func(c *fiber.Ctx) error {
+			if c.Method() == fiber.MethodOptions {
+				c.Set("Access-Control-Allow-Origin", "*")
+				c.Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-Idempotency-Key, Idempotency-Key")
+				c.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				return c.SendStatus(fiber.StatusNoContent)
+			}
+
+			targetURL := baseURL + c.OriginalURL()
+			if err := proxy.Do(c, targetURL); err != nil {
+				logger.Error("❌ Gateway Proxy Error", "url", targetURL, "error", err.Error())
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+					"status":  "error",
+					"message": "Không thể kết nối tới Microservice đích (502 Bad Gateway)",
+				})
+			}
+
+			// Đảm bảo các headers CORS luôn tồn tại sau khi proxy.Do sao chép từ upstream
+			c.Response().Header.Set("Access-Control-Allow-Origin", "*")
+			c.Response().Header.Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Request-ID, X-Idempotency-Key, Idempotency-Key")
+			c.Response().Header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+
+			return nil
+		}
+	}
+
 	// 5. REVERSE PROXY ROUTING: Chuyển tiếp tới User Microservice (Port 8001)
 	userRoutes := []string{
 		"/register",
@@ -96,11 +124,7 @@ func main() {
 		"/user/*",
 	}
 	for _, route := range userRoutes {
-		targetRoute := route
-		app.All(targetRoute, func(c *fiber.Ctx) error {
-			targetURL := userServiceURL + c.OriginalURL()
-			return proxy.Do(c, targetURL)
-		})
+		app.All(route, proxyTo(userServiceURL))
 	}
 
 	// 6. REVERSE PROXY ROUTING: Chuyển tiếp tới Product Microservice (Port 8002)
@@ -111,11 +135,7 @@ func main() {
 		"/products/*",
 	}
 	for _, route := range productRoutes {
-		targetRoute := route
-		app.All(targetRoute, func(c *fiber.Ctx) error {
-			targetURL := productServiceURL + c.OriginalURL()
-			return proxy.Do(c, targetURL)
-		})
+		app.All(route, proxyTo(productServiceURL))
 	}
 
 	// 7. REVERSE PROXY ROUTING: Chuyển tiếp tới Order Microservice (Port 8003)
@@ -126,11 +146,7 @@ func main() {
 		"/orders/*",
 	}
 	for _, route := range orderRoutes {
-		targetRoute := route
-		app.All(targetRoute, func(c *fiber.Ctx) error {
-			targetURL := orderServiceURL + c.OriginalURL()
-			return proxy.Do(c, targetURL)
-		})
+		app.All(route, proxyTo(orderServiceURL))
 	}
 
 	// 7. Fallback 404

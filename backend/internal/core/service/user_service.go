@@ -33,9 +33,12 @@ func NewUserService(repo domain.UserRepository, cfg config.AppConfig, distributo
 }
 
 type PendingUser struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	OTP      int    `json:"otp"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Phone     string `json:"phone"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	OTP       int    `json:"otp"`
 }
 
 func (s UserService) Signup(input dto.UserSignup) (string, error) {
@@ -59,9 +62,12 @@ func (s UserService) Signup(input dto.UserSignup) (string, error) {
 
 	// 4. Lưu thông tin tạm vào Redis với TTL 15 phút
 	pendingUser := PendingUser{
-		Email:    input.Email,
-		Password: hashedPassword,
-		OTP:      otpCode,
+		FirstName: input.FirstName,
+		LastName:  input.LastName,
+		Phone:     input.Phone,
+		Email:     input.Email,
+		Password:  hashedPassword,
+		OTP:       otpCode,
 	}
 
 	pendingBytes, _ := json.Marshal(pendingUser)
@@ -90,37 +96,40 @@ func (s UserService) Signup(input dto.UserSignup) (string, error) {
 	return "Vui lòng kiểm tra email để nhận mã xác thực (có hiệu lực 15 phút)", nil
 }
 
-func (s UserService) VerifyEmail(email string, code int) (string, error) {
+func (s UserService) VerifyEmail(email string, code int) (string, *domain.User, error) {
 	redisKey := fmt.Sprintf("verify:user:%s", email)
 
 	// 1. Lấy thông tin từ Redis
 	val, err := s.redisClient.Get(context.Background(), redisKey).Result()
 	if err == redis.Nil {
-		return "", errors.New("mã xác thực đã hết hạn hoặc email không chính xác")
+		return "", nil, errors.New("mã xác thực đã hết hạn hoặc email không chính xác")
 	} else if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	var pendingUser PendingUser
 	if err := json.Unmarshal([]byte(val), &pendingUser); err != nil {
-		return "", errors.New("lỗi hệ thống khi đọc dữ liệu")
+		return "", nil, errors.New("lỗi hệ thống khi đọc dữ liệu")
 	}
 
 	// 2. So sánh mã OTP
 	if pendingUser.OTP != code {
-		return "", errors.New("mã xác thực không chính xác")
+		return "", nil, errors.New("mã xác thực không chính xác")
 	}
 
 	// 3. OTP hợp lệ -> Lưu vào PostgreSQL
 	user := &domain.User{
-		Email:    pendingUser.Email,
-		Password: pendingUser.Password,
-		UserType: domain.RoleCustomer,
+		FirstName: pendingUser.FirstName,
+		LastName:  pendingUser.LastName,
+		Email:     pendingUser.Email,
+		Password:  pendingUser.Password,
+		UserType:  domain.RoleCustomer,
+		Verified:  true,
 	}
 
 	err = s.repo.CreateUser(user)
 	if err != nil {
-		return "", errors.New("không thể tạo tài khoản lúc này")
+		return "", nil, errors.New("không thể tạo tài khoản lúc này")
 	}
 
 	// 4. Xóa key trong Redis
@@ -129,26 +138,26 @@ func (s UserService) VerifyEmail(email string, code int) (string, error) {
 	// 5. Cấp JWT Token
 	token, err := utils.GenerateTokenWithRole(user.ID, user.UserType, s.config.AppSecret)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	return token, nil
+	return token, user, nil
 }
 
 func (s UserService) findUserByEmail(email string) (*domain.User, error) {
 	return s.repo.FindUserByEmail(email)
 }
 
-func (s UserService) Login(input dto.UserLogin) (string, error) {
+func (s UserService) Login(input dto.UserLogin) (string, *domain.User, error) {
 	// 1. Tìm user bằng email
 	user, err := s.repo.FindUserByEmail(input.Email)
 	if err != nil {
-		return "", errors.New("tài khoản không tồn tại")
+		return "", nil, errors.New("tài khoản không tồn tại")
 	}
 
 	// 2. Kiểm tra mật khẩu
 	if !utils.CheckPasswordHash(input.Password, user.Password) {
-		return "", errors.New("mật khẩu không chính xác")
+		return "", nil, errors.New("mật khẩu không chính xác")
 	}
 
 	// 3. Tạo JWT Token với Role
@@ -158,10 +167,10 @@ func (s UserService) Login(input dto.UserLogin) (string, error) {
 	}
 	token, err := utils.GenerateTokenWithRole(user.ID, userRole, s.config.AppSecret)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	return token, nil
+	return token, user, nil
 }
 
 func (s UserService) GetVerificationCode(e domain.User) (int, error) {

@@ -22,16 +22,37 @@ export function Navbar() {
     };
     window.addEventListener("scroll", handleScroll);
 
-    // Kiểm tra user đăng nhập
-    const userStr = localStorage.getItem("user_info");
-    if (userStr) {
-      try {
-        const u = JSON.parse(userStr);
-        setUserName(u.first_name || u.email);
-      } catch (e) {}
-    }
+    const checkAuth = () => {
+      const token = localStorage.getItem("access_token");
+      if (!token) {
+        setUserName(null);
+        return;
+      }
 
-    return () => window.removeEventListener("scroll", handleScroll);
+      const userStr = localStorage.getItem("user_info");
+      if (userStr) {
+        try {
+          const u = JSON.parse(userStr);
+          if (u && typeof u === "object") {
+            setUserName(u.first_name || u.email || "Khách hàng");
+            return;
+          }
+        } catch (e) {}
+      }
+
+      // Có token hợp lệ nhưng user_info chưa có hoặc bị rỗng
+      setUserName("Khách hàng");
+    };
+
+    checkAuth();
+    window.addEventListener("auth-changed", checkAuth);
+    window.addEventListener("storage", checkAuth);
+
+    return () => {
+      window.removeEventListener("scroll", handleScroll);
+      window.removeEventListener("auth-changed", checkAuth);
+      window.removeEventListener("storage", checkAuth);
+    };
   }, []);
 
   const handleSearch = (e: React.FormEvent) => {
@@ -44,6 +65,7 @@ export function Navbar() {
   const handleLogout = () => {
     localStorage.removeItem("access_token");
     localStorage.removeItem("user_info");
+    window.dispatchEvent(new Event("auth-changed"));
     setUserName(null);
     router.push("/");
   };
@@ -120,6 +142,13 @@ export function Navbar() {
             {/* User Auth Info */}
             {userName ? (
               <div className="flex items-center gap-2">
+                <Link
+                  href="/orders"
+                  className="hidden sm:inline-flex items-center gap-1 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-blue-600 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+                >
+                  <ShoppingBag className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Đơn mua</span>
+                </Link>
                 <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-sm font-medium text-slate-800 dark:text-slate-200">
                   <User className="w-4 h-4 text-blue-600" />
                   <span>Chào, {userName}</span>

@@ -16,4 +16,6 @@ main
 .idea/
 .vscode/
 *.code-workspace
-*.swp
+# Logs
+logs/
+*.log

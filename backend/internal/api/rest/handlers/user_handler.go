@@ -64,13 +64,21 @@ func (h *UserHandler) VerifyEmail(ctx *fiber.Ctx) error {
 		return response.BadRequest(ctx, "Dữ liệu xác thực không hợp lệ", "INVALID_BODY")
 	}
 
-	token, err := h.svc.VerifyEmail(req.Email, req.Code)
+	token, user, err := h.svc.VerifyEmail(req.Email, req.Code)
 	if err != nil {
 		return response.BadRequest(ctx, err.Error(), "VERIFICATION_FAILED")
 	}
 
 	return response.Success(ctx, http.StatusOK, "Xác thực email thành công!", fiber.Map{
 		"token": token,
+		"user": fiber.Map{
+			"id":         user.ID,
+			"email":      user.Email,
+			"first_name": user.FirstName,
+			"last_name":  user.LastName,
+			"role":       user.UserType,
+			"verified":   user.Verified,
+		},
 	})
 }
 
@@ -82,12 +90,20 @@ func (h *UserHandler) Login(ctx *fiber.Ctx) error {
 		return response.BadRequest(ctx, "Thông tin đăng nhập không hợp lệ", "INVALID_BODY")
 	}
 
-	token, err := h.svc.Login(loginReq)
+	token, user, err := h.svc.Login(loginReq)
 	if err != nil {
 		return response.Unauthorized(ctx, err.Error())
 	}
 
 	return response.Success(ctx, http.StatusOK, "Đăng nhập thành công!", fiber.Map{
 		"token": token,
+		"user": fiber.Map{
+			"id":         user.ID,
+			"email":      user.Email,
+			"first_name": user.FirstName,
+			"last_name":  user.LastName,
+			"role":       user.UserType,
+			"verified":   user.Verified,
+		},
 	})
 }
