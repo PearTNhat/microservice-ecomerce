@@ -81,15 +81,28 @@ export function ProductCard({ product }: ProductCardProps) {
 
         {/* Price & Action */}
         <div className="pt-2 border-t border-slate-100 dark:border-slate-800/80">
-          <div className="flex items-baseline gap-2">
-            <span className="text-base font-extrabold text-blue-600 dark:text-blue-400">
-              {formatPrice(currentPrice)}
-            </span>
-            {product.discount_price && product.discount_price < product.price && (
-              <span className="text-xs text-slate-400 line-through">
-                {formatPrice(product.price)}
+          <div className="flex items-center justify-between">
+            <div className="flex items-baseline gap-2">
+              <span className="text-base font-extrabold text-blue-600 dark:text-blue-400">
+                {formatPrice(currentPrice)}
               </span>
-            )}
+              {product.discount_price && product.discount_price < product.price && (
+                <span className="text-xs text-slate-400 line-through">
+                  {formatPrice(product.price)}
+                </span>
+              )}
+            </div>
+            <span
+              className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                product.stock > 5
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                  : product.stock > 0
+                  ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 animate-pulse"
+                  : "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
+              }`}
+            >
+              {product.stock > 0 ? `Còn ${product.stock}` : "Hết hàng"}
+            </span>
           </div>
 
           <div className="mt-3 flex items-center gap-2">

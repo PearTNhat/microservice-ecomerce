@@ -12,11 +12,14 @@ export function Navbar() {
   const [isScrolled, setIsScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userName, setUserName] = useState<string | null>(null);
+  const [mounted, setMounted] = useState(false);
 
   const { getTotalItems, openCart } = useCartStore();
   const totalItems = getTotalItems();
 
   useEffect(() => {
+    setMounted(true);
+
     const handleScroll = () => {
       setIsScrolled(window.scrollY > 20);
     };
@@ -40,7 +43,6 @@ export function Navbar() {
         } catch (e) {}
       }
 
-      // Có token hợp lệ nhưng user_info chưa có hoặc bị rỗng
       setUserName("Khách hàng");
     };
 
@@ -132,15 +134,15 @@ export function Navbar() {
               aria-label="Giỏ hàng"
             >
               <ShoppingBag className="w-5 h-5" />
-              {totalItems > 0 && (
+              {mounted && totalItems > 0 && (
                 <span className="absolute -top-1 -right-1 bg-blue-600 text-white text-[11px] font-bold w-5 h-5 rounded-full flex items-center justify-center border-2 border-white dark:border-slate-900 shadow-sm animate-pulse">
                   {totalItems}
                 </span>
               )}
             </button>
 
-            {/* User Auth Info */}
-            {userName ? (
+            {/* User Auth Info (SSR-safe with mounted check) */}
+            {mounted && userName ? (
               <div className="flex items-center gap-2">
                 <Link
                   href="/orders"
@@ -161,7 +163,7 @@ export function Navbar() {
                   <LogOut className="w-5 h-5" />
                 </button>
               </div>
-            ) : (
+            ) : mounted ? (
               <Link
                 href="/login"
                 className="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl shadow-sm hover:shadow-blue-500/20 transition"
@@ -169,6 +171,8 @@ export function Navbar() {
                 <LogIn className="w-4 h-4" />
                 <span className="hidden sm:inline">Đăng nhập</span>
               </Link>
+            ) : (
+              <div className="w-24 h-9 rounded-xl bg-slate-100 dark:bg-slate-800 animate-pulse" />
             )}
 
             {/* Mobile Menu Toggle */}

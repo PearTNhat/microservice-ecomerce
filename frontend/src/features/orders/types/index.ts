@@ -61,3 +61,30 @@ export interface OrderListResponse {
   limit: number;
   total_pages: number;
 }
+
+// Flash Sale Payloads & Responses
+export interface FlashSaleOrderPayload {
+  product_id: number;
+  quantity: number;
+  customer_name: string;
+  customer_email: string;
+  customer_phone: string;
+  shipping_address: string;
+  payment_method: PaymentMethod;
+}
+
+export interface FlashSaleAsyncResponse {
+  order_token: string;
+  status: string;
+  message: string;
+  check_status_url: string;
+}
+
+export interface FlashSaleStatusResponse {
+  order_token: string;
+  status: "PENDING" | "SUCCESS" | "FAILED" | "NOT_FOUND";
+  order_id?: number;
+  order_code?: string;
+  reason?: string;
+  updated_at?: string;
+}

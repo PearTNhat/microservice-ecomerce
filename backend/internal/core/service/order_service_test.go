@@ -336,6 +336,12 @@ func (m *mockProductRepositoryForOrderService) IncrementViews(id uint) error {
 func (m *mockProductRepositoryForOrderService) BatchIncrementViews(viewCounts map[uint]int64) error {
 	return nil
 }
+func (m *mockProductRepositoryForOrderService) DeductStock(id uint, quantity int) error {
+	return nil
+}
+func (m *mockProductRepositoryForOrderService) RevertStock(id uint, quantity int) error {
+	return nil
+}
 func (m *mockProductRepositoryForOrderService) Count() (int64, error) {
 	return int64(len(m.products)), nil
 }

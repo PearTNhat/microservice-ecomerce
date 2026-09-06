@@ -178,6 +178,27 @@ func (r *productRepository) Count() (int64, error) {
 	return count, err
 }
 
+// DeductStock trừ tồn kho trực tiếp trong PostgreSQL bằng Atomic SQL Expression (Chống Lost Update)
+func (r *productRepository) DeductStock(id uint, quantity int) error {
+	res := r.db.Model(&domain.Product{}).
+		Where("id = ? AND stock >= ?", id, quantity).
+		UpdateColumn("stock", gorm.Expr("stock - ?", quantity))
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("không đủ tồn kho trong Database")
+	}
+	return nil
+}
+
+// RevertStock hoàn lại tồn kho trong PostgreSQL nếu đơn hàng bị hủy hoặc rollback
+func (r *productRepository) RevertStock(id uint, quantity int) error {
+	return r.db.Model(&domain.Product{}).
+		Where("id = ?", id).
+		UpdateColumn("stock", gorm.Expr("stock + ?", quantity)).Error
+}
+
 // SeedSampleData tạo dữ liệu mẫu thực tế về sản phẩm điện máy và đồng bộ vào Elasticsearch
 func SeedSampleData(db *gorm.DB, esClient elasticsearch.SearchClient) {
 	var count int64

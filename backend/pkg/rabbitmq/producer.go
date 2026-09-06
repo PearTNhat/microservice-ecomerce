@@ -20,6 +20,11 @@ const (
 	RoutingOrderPaid      = "order.paid"
 	RoutingOrderCancelled = "order.cancelled"
 	RoutingOrderDLQ       = "order.dead_letter"
+
+	// Flash Sale Constants
+	ExchangeFlashSaleTopic = "ecom.flashsale.topic"
+	QueueFlashSaleOrders   = "flashsale.orders.queue"
+	RoutingFlashSaleCreate = "flashsale.order.create"
 )
 
 // OrderItemEventPayload chứa thông tin từng món hàng trong sự kiện
@@ -46,11 +51,28 @@ type OrderCreatedPayload struct {
 	CreatedAt       time.Time               `json:"created_at"`
 }
 
-// OrderEventProducer interface phát các sự kiện liên quan đến đơn hàng
+// FlashSaleOrderTaskPayload chứa dữ liệu tác vụ tạo đơn Flash Sale bất đồng bộ
+type FlashSaleOrderTaskPayload struct {
+	OrderToken      string    `json:"order_token"`
+	UserID          string    `json:"user_id"`
+	ProductID       uint      `json:"product_id"`
+	Quantity        int       `json:"quantity"`
+	Price           float64   `json:"price"`
+	CustomerName    string    `json:"customer_name"`
+	CustomerEmail   string    `json:"customer_email"`
+	CustomerPhone   string    `json:"customer_phone"`
+	ShippingAddress string    `json:"shipping_address"`
+	PaymentMethod   string    `json:"payment_method"`
+	TraceID         string    `json:"trace_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// OrderEventProducer interface phát các sự kiện liên quan đến đơn hàng và Flash Sale
 type OrderEventProducer interface {
 	PublishOrderCreated(ctx context.Context, payload OrderCreatedPayload) error
 	PublishOrderPaid(ctx context.Context, orderID uint, amount float64) error
 	PublishOrderCancelled(ctx context.Context, orderID uint, reason string) error
+	PublishFlashSaleOrderTask(ctx context.Context, payload FlashSaleOrderTaskPayload) error
 	Close() error
 }
 
@@ -108,7 +130,7 @@ func NewRabbitMQProducer(amqpURL string) OrderEventProducer {
 
 	_ = ch.QueueBind(QueueOrderDLQ, RoutingOrderDLQ, ExchangeOrdersDLX, false, nil)
 
-	// 2. Khai báo Main Topic Exchange
+	// 2. Khai báo Main Orders Topic Exchange
 	err = ch.ExchangeDeclare(
 		ExchangeOrdersTopic,
 		"topic",
@@ -143,7 +165,35 @@ func NewRabbitMQProducer(amqpURL string) OrderEventProducer {
 
 	_ = ch.QueueBind(QueueOrderEmail, RoutingOrderCreated, ExchangeOrdersTopic, false, nil)
 
-	logger.Info("✅ Đã khởi tạo RabbitMQ Producer & Exchanges/Queues thành công", "url", amqpURL)
+	// 4. Khai báo Flash Sale Topic Exchange & Queue cắt đỉnh tải (Peak Clipping)
+	err = ch.ExchangeDeclare(
+		ExchangeFlashSaleTopic,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		logger.Error("❌ Không thể khai báo Flash Sale Topic Exchange", "error", err.Error())
+	}
+
+	_, err = ch.QueueDeclare(
+		QueueFlashSaleOrders,
+		true,
+		false,
+		false,
+		false,
+		queueArgs,
+	)
+	if err != nil {
+		logger.Error("❌ Không thể khai báo Flash Sale Queue", "error", err.Error())
+	}
+
+	_ = ch.QueueBind(QueueFlashSaleOrders, RoutingFlashSaleCreate, ExchangeFlashSaleTopic, false, nil)
+
+	logger.Info("✅ Đã khởi tạo RabbitMQ Producer & Flash Sale Queue thành công", "url", amqpURL)
 
 	return &rabbitMQProducer{
 		conn:    conn,
@@ -247,6 +297,56 @@ func (p *rabbitMQProducer) PublishOrderCancelled(ctx context.Context, orderID ui
 	)
 }
 
+func (p *rabbitMQProducer) PublishFlashSaleOrderTask(ctx context.Context, payload FlashSaleOrderTaskPayload) error {
+	if payload.CreatedAt.IsZero() {
+		payload.CreatedAt = time.Now()
+	}
+	if payload.TraceID == "" {
+		payload.TraceID = logger.GetTraceID(ctx)
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("lỗi serialize flash sale task: %w", err)
+	}
+
+	msg := amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		Timestamp:    time.Now(),
+		Body:         data,
+		Headers: amqp.Table{
+			"trace_id":    payload.TraceID,
+			"order_token": payload.OrderToken,
+		},
+	}
+
+	err = p.channel.PublishWithContext(
+		ctx,
+		ExchangeFlashSaleTopic,
+		RoutingFlashSaleCreate,
+		false,
+		false,
+		msg,
+	)
+	if err != nil {
+		logger.Error("❌ Lỗi publish flash sale task tới RabbitMQ",
+			"order_token", payload.OrderToken,
+			"product_id", payload.ProductID,
+			"error", err.Error(),
+		)
+		return err
+	}
+
+	logger.Info("⚡ [RABBITMQ FLASH SALE] Đã đưa đơn hàng vào hàng đợi xử lý",
+		"order_token", payload.OrderToken,
+		"user_id", payload.UserID,
+		"product_id", payload.ProductID,
+	)
+
+	return nil
+}
+
 func (p *rabbitMQProducer) Close() error {
 	if p.channel != nil {
 		_ = p.channel.Close()
@@ -267,6 +367,9 @@ func (n *noopRabbitMQProducer) PublishOrderPaid(ctx context.Context, orderID uin
 	return nil
 }
 func (n *noopRabbitMQProducer) PublishOrderCancelled(ctx context.Context, orderID uint, reason string) error {
+	return nil
+}
+func (n *noopRabbitMQProducer) PublishFlashSaleOrderTask(ctx context.Context, payload FlashSaleOrderTaskPayload) error {
 	return nil
 }
 func (n *noopRabbitMQProducer) Close() error {

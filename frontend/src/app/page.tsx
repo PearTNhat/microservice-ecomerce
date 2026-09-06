@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { FlashSaleSection } from "@/features/flash-sale/components/flash-sale-section";
 import { ProductCard } from "@/features/products/components/product-card";
 import { productService } from "@/features/products/services/product-service";
 import {
@@ -107,7 +108,12 @@ export default async function HomePage() {
         </div>
       </section>
 
-      {/* 2. CATEGORIES SECTION */}
+      {/* 2. FLASH SALE SECTION (REDIS ATOMIC LOCK + RABBITMQ PEAK CLIPPING) */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <FlashSaleSection products={products} />
+      </div>
+
+      {/* 3. CATEGORIES SECTION */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between mb-8">
           <div>
@@ -142,7 +148,7 @@ export default async function HomePage() {
         </div>
       </section>
 
-      {/* 3. HOT PRODUCTS (REDIS CACHE + SINGLEFLIGHT) */}
+      {/* 4. HOT PRODUCTS (REDIS CACHE + SINGLEFLIGHT) */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between mb-8">
           <div className="flex items-center gap-2">

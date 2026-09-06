@@ -14,6 +14,8 @@ import (
 	"os"
 
 	"github.com/redis/go-redis/v9"
+	gormPostgres "gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -63,10 +65,23 @@ func main() {
 	cartRepo := postgres.NewCartRepository(server.DB)
 	orderRepo := postgres.NewOrderRepository(server.DB)
 
-	cartService := service.NewCartService(cartRepo, nil)
-	orderService := service.NewOrderService(orderRepo, cartRepo, nil, importRedis, rabbitMQProducer)
+	// Kết nối Product Repository để đọc giá và đồng bộ tồn kho Flash Sale
+	var productRepo domain.ProductRepository
+	productDns := appConfig.ProductDbDns
+	if productDns == "" {
+		productDns = appConfig.Dns
+	}
+	productDb, pErr := gorm.Open(gormPostgres.Open(productDns), &gorm.Config{})
+	if pErr == nil {
+		productRepo = postgres.NewProductRepository(productDb)
+	} else {
+		productRepo = postgres.NewProductRepository(server.DB)
+	}
 
-	// 6. Khởi chạy RabbitMQ Worker gửi Email hóa đơn ngầm
+	cartService := service.NewCartService(cartRepo, productRepo)
+	orderService := service.NewOrderService(orderRepo, cartRepo, productRepo, importRedis, rabbitMQProducer)
+
+	// 6. Khởi chạy RabbitMQ Workers: Email Worker + Flash Sale Async Worker
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -74,6 +89,12 @@ func main() {
 	if emailWorker != nil {
 		_ = emailWorker.Start(ctx)
 		defer emailWorker.Close()
+	}
+
+	flashSaleWorker := worker.NewFlashSaleWorker(appConfig, orderRepo, productRepo, importRedis, rabbitMQProducer)
+	if flashSaleWorker != nil {
+		_ = flashSaleWorker.Start(ctx)
+		defer flashSaleWorker.Close()
 	}
 
 	// 7. Đăng ký REST Routes theo từng module

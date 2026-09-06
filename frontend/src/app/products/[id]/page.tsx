@@ -163,9 +163,20 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
                 </span>
               )}
             </div>
-            <div className="flex items-center gap-2 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-              <CheckCircle2 className="w-4 h-4" />
-              <span>Giá đã bao gồm VAT và gói bảo hành chính hãng tận nơi</span>
+            <div className="flex items-center justify-between gap-2 pt-1 border-t border-blue-100 dark:border-slate-800">
+              <div className="flex items-center gap-2 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Giá đã bao gồm VAT và bảo hành chính hãng</span>
+              </div>
+              <div className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+                product.stock > 5
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                  : product.stock > 0
+                  ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                  : "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
+              }`}>
+                {product.stock > 0 ? `Tồn kho: ${product.stock} chiếc` : "Tạm hết hàng"}
+              </div>
             </div>
           </div>
 

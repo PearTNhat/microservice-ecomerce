@@ -147,19 +147,19 @@ sequenceDiagram
 ```
 
 #### 📋 Danh sách Task Cần Thực Thi:
-- [ ] **1. Quản lý Tồn kho & Nạp trước (Stock Pre-warming):**
+- [x] **1. Quản lý Tồn kho & Nạp trước (Stock Pre-warming):**
   - Viết helper / endpoint `POST /orders/flash-sale/prewarm` cho phép Admin nạp trước số lượng sản phẩm lên key Redis `product:stock:<id>` trước giờ G.
   - Bổ sung cơ chế Rollback an toàn đa món (`RevertStockAtomic`) nếu giỏ hàng bị lỗi giữa chừng.
-- [ ] **2. Kênh Message Queue Cắt Đỉnh Tải (RabbitMQ Flash Sale):**
+- [x] **2. Kênh Message Queue Cắt Đỉnh Tải (RabbitMQ Flash Sale):**
   - Khai báo Exchange `ecom.flashsale.topic`, Queue `flashsale.orders.queue`, Routing key `flashsale.order.create` trong [producer.go](file:///home/nhat/Workspace/microserice-ecomerce/backend/pkg/rabbitmq/producer.go).
   - Bổ sung struct `FlashSaleOrderTaskPayload` và hàm `PublishFlashSaleOrderTask()`.
-- [ ] **3. Order Service - Luồng Bất Đồng Bộ (Async Flash Sale):**
+- [x] **3. Order Service - Luồng Bất Đồng Bộ (Async Flash Sale):**
   - Thêm phương thức `CreateFlashSaleOrderAsync()`: Trừ kho trên Redis $\rightarrow$ Lưu trạng thái `PENDING` $\rightarrow$ Đẩy task vào RabbitMQ $\rightarrow$ Trả về mã Token `FSO-...` (HTTP 202 Accepted).
   - Thêm phương thức `GetFlashSaleOrderStatus()`: Đọc kết quả tạo đơn trực tiếp từ RAM Redis (Zero DB Hit).
-- [ ] **4. Flash Sale Order Worker (`internal/worker/flash_sale_worker.go`):**
+- [x] **4. Flash Sale Order Worker (`internal/worker/flash_sale_worker.go`):**
   - Lắng nghe `flashsale.orders.queue` với `Qos(20)`.
   - Ghi đơn hàng vào PostgreSQL một cách ổn định, tự động hoàn trả kho Redis nếu DB lỗi và cập nhật trạng thái `SUCCESS` / `FAILED`.
-- [ ] **5. REST Endpoints & Gateway Routing:**
+- [x] **5. REST Endpoints & Gateway Routing:**
   - `POST /orders/flash-sale` (Đặt hàng Flash Sale bất đồng bộ).
   - `GET /orders/flash-sale/status/:token` (Kiểm tra tiến độ đơn hàng).
   - `POST /orders/flash-sale/prewarm` (Nạp trước kho - Admin).

@@ -24,6 +24,9 @@ test:
 test-e2e:
 	./test_e2e_order.sh
 
+test-flash-sale:
+	./test_flash_sale.sh
+
 # Biên dịch tất cả binaries
 build-all:
 	@mkdir -p bin

@@ -61,3 +61,38 @@ type OrderListResponse struct {
 type UpdateOrderStatusRequest struct {
 	Status string `json:"status" validate:"required,oneof=PENDING CONFIRMED PROCESSING SHIPPED DELIVERED CANCELLED"`
 }
+
+// FlashSaleOrderRequest yêu cầu mua hàng Flash Sale bất đồng bộ
+type FlashSaleOrderRequest struct {
+	ProductID       uint   `json:"product_id" validate:"required,gt=0"`
+	Quantity        int    `json:"quantity" validate:"required,gt=0"`
+	CustomerName    string `json:"customer_name" validate:"required"`
+	CustomerEmail   string `json:"customer_email" validate:"required,email"`
+	CustomerPhone   string `json:"customer_phone" validate:"required"`
+	ShippingAddress string `json:"shipping_address" validate:"required"`
+	PaymentMethod   string `json:"payment_method" validate:"required,oneof=COD VNPAY MOMO BANK_TRANSFER"`
+}
+
+// FlashSaleOrderAsyncResponse phản hồi tức thì khi đưa đơn vào hàng đợi (HTTP 202 Accepted)
+type FlashSaleOrderAsyncResponse struct {
+	OrderToken     string `json:"order_token"`
+	Status         string `json:"status"`
+	Message        string `json:"message"`
+	CheckStatusURL string `json:"check_status_url"`
+}
+
+// FlashSaleStatusResponse kết quả polling trạng thái đơn hàng từ Redis RAM
+type FlashSaleStatusResponse struct {
+	OrderToken string `json:"order_token"`
+	Status     string `json:"status"` // PENDING, SUCCESS, FAILED
+	OrderID    uint   `json:"order_id,omitempty"`
+	OrderCode  string `json:"order_code,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
+// PrewarmStockRequest yêu cầu nạp trước tồn kho Flash Sale
+type PrewarmStockRequest struct {
+	ProductID uint `json:"product_id" validate:"required,gt=0"`
+	Stock     int  `json:"stock" validate:"required,gte=0"`
+}

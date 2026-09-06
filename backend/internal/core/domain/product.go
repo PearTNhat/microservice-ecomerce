@@ -70,5 +70,7 @@ type ProductRepository interface {
 	CreateBrand(brand *Brand) error
 	IncrementViews(id uint) error
 	BatchIncrementViews(viewCounts map[uint]int64) error
+	DeductStock(id uint, quantity int) error
+	RevertStock(id uint, quantity int) error
 	Count() (int64, error)
 }

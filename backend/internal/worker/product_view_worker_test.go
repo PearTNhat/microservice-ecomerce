@@ -28,6 +28,8 @@ func (m *mockProductRepoForWorker) CreateProduct(product *domain.Product) error 
 func (m *mockProductRepoForWorker) CreateCategory(category *domain.Category) error     { return nil }
 func (m *mockProductRepoForWorker) CreateBrand(brand *domain.Brand) error               { return nil }
 func (m *mockProductRepoForWorker) IncrementViews(id uint) error                        { return nil }
+func (m *mockProductRepoForWorker) DeductStock(id uint, quantity int) error             { return nil }
+func (m *mockProductRepoForWorker) RevertStock(id uint, quantity int) error             { return nil }
 func (m *mockProductRepoForWorker) Count() (int64, error)                               { return 0, nil }
 
 func (m *mockProductRepoForWorker) BatchIncrementViews(viewCounts map[uint]int64) error {
