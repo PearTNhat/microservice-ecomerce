@@ -1,60 +1,104 @@
-# 🤖 AI Agent Guidelines: Clean Architecture in Go
+# 🤖 AI Agent Guidelines: Clean Architecture & Event-Driven Microservices
 
-This document serves as the **Standard Operating Procedure (SOP)** for any AI agents (or human developers) modifying or expanding this Go Microservice.
-
-## 🏛 Core Architectural Pattern: Clean Architecture
-This project strictly follows the **Clean Architecture** principles. The fundamental rule is: **Dependencies MUST point inwards**. 
-Outer layers (API, Database) depend on inner layers (Service, Domain). Inner layers MUST NEVER depend on outer layers.
+This document serves as the **Standard Operating Procedure (SOP)** for any AI agents (or human developers) modifying or expanding this Go E-Commerce Microservices repository.
 
 ---
 
-### 1. Domain Layer (`internal/core/domain`)
-- **Role:** The absolute core of the system. Contains business entities (Structs) and Repository Interfaces.
-- **Rules:**
-  - 🚫 **MUST NOT** import any other package from `internal/*`.
-  - 🚫 **MUST NOT** import any framework-specific libraries (like Fiber, gRPC, Asynq).
-  - ✅ **DO** define structs (e.g., `User`) and repository interfaces here.
+## 🏛 1. Core Architectural Pattern: Multi-Module Clean Architecture
 
-### 2. Service (Use Case) Layer (`internal/core/service`)
-- **Role:** Contains all the business logic and application rules.
-- **Rules:**
-  - ✅ **DO** import `domain`, `dto`, and generic utilities (`config`, `pkg/utils`).
-  - 🚫 **MUST NOT** import `api` (no `*fiber.Ctx`, no `*pb.Request`).
-  - 🚫 **MUST NOT** import `repository/postgres` directly (only depend on the interface from `domain`).
-  - Business logic MUST be placed here, NEVER in handlers.
+This project strictly follows the **Clean Architecture** principles within a **Multi-Module Monorepo** managed by `go.work`.
 
-### 3. Data/Repository Layer (`internal/repository/...`)
-- **Role:** Implements the interfaces defined in the Domain layer. Interacts with the actual Database (PostgreSQL via GORM).
-- **Rules:**
-  - ✅ **DO** import `domain`.
-  - 🚫 **MUST NOT** contain business rules. Its only job is to Create, Read, Update, and Delete data.
+### 🚨 The Fundamental Dependency Rule
+> **Dependencies MUST ALWAYS point inwards.**
+> Outer layers (`delivery`, `repository`, `client`, `worker`) depend on inner layers (`service`, `domain`).
+> Inner layers MUST NEVER depend on outer layers.
 
-### 4. Delivery/API Layer (`internal/api`)
-- **Role:** The entry points of the application (REST & gRPC).
-- **Sub-folders:**
-  - `rest/handlers`: Handles HTTP parsing, validation using Fiber, and calls the Service layer. Returns JSON.
-  - `grpc/handlers`: Handles Protobuf parsing and calls the SAME Service layer. Returns Protobuf responses.
-- **Rules:**
-  - 🚫 **MUST NOT** contain any business logic (No IF/ELSE checking passwords, no DB queries).
-  - ✅ **DO** act as a "Thin layer": Receive Request -> Parse to DTO -> Call Service -> Format Response.
-
-### 5. DTO Layer (`internal/dto`)
-- **Role:** Data Transfer Objects. Defines the exact shape of data moving between the API layer and the Service layer.
-- **Rules:**
-  - ✅ **DO** use DTOs to decouple the Service layer from HTTP (Fiber) or gRPC (Protobuf) specific structures.
-
-### 6. Worker Layer (`internal/worker`)
-- **Role:** Handles asynchronous background jobs (using Asynq/Redis).
-- **Rules:**
-  - `Distributor`: Pushes jobs to the queue.
-  - `Processor`: Pulls jobs and executes them. Can call Services or external APIs (e.g., SMTP).
+```
+services/<service-name>/
+├── cmd/                             # Composition Root (Dependency Injection only)
+│   └── <service-name>/main.go
+└── internal/
+    ├── domain/                      # 1. Enterprise Core: Entities & Interfaces (ZERO external imports)
+    ├── dto/                         # Data Transfer Objects
+    ├── service/                     # 2. Use Cases: Business logic (depends ONLY on domain interfaces)
+    ├── repository/                  # 3. Adapters: Database implementations (GORM/PostgreSQL)
+    ├── client/                      # 3. Adapters: External service clients (HTTP/gRPC)
+    ├── worker/                      # 3. Adapters: Kafka event consumers
+    └── delivery/                    # 4. Frameworks & Drivers
+        ├── http/handlers/           # Fiber HTTP REST Handlers
+        └── grpc/handlers/           # gRPC Handlers (if applicable)
+```
 
 ---
 
-## 🚦 Important Coding Standards for Agents
-1. **Dependency Injection (DI):** Always use DI. Never use global variables for DB connections or services. Pass dependencies via constructor functions (e.g., `NewUserService(repo, config)`).
-2. **Global 404 Handler:** A catch-all route is implemented at the bottom of the Fiber setup in `cmd/server/main.go`. Do not overwrite it.
-3. **Database Migrations:** Do not rely on GORM's `AutoMigrate` for deleting columns. Remember that GORM does not automatically drop columns.
-4. **Environment Variables:** Never hardcode secrets. Always use the `config.AppConfig` struct.
+## 📂 2. Layer Guidelines & Strict Constraints
 
-> **To AI Agent:** Acknowledge this architecture in your thought process before writing or modifying any Go code in this project.
+### 1. Domain Layer (`services/*/internal/domain/`)
+- **Role:** Pure business entities and repository/client contracts (Interfaces).
+- **Rules:**
+  - 🚫 **MUST NOT** import any external framework (NO Fiber, Gin, GORM, Postgres, Kafka, Asynq).
+  - 🚫 **MUST NOT** import any sibling packages (`service`, `repository`, `delivery`).
+  - ✅ **DO** define structs (e.g., `Order`, `Product`, `User`) and interfaces (e.g., `OrderRepository`, `ProductClient`).
+
+### 2. Service (Use Case) Layer (`services/*/internal/service/`)
+- **Role:** Implements all core business rules and use cases.
+- **Rules:**
+  - ✅ **DO** import `domain`, `dto`, and shared utilities (`pkg/config`, `pkg/logger`, `pkg/utils`).
+  - 🚫 **MUST NOT** import `delivery` (NO `*fiber.Ctx`, NO Protobuf request/response structs).
+  - 🚫 **MUST NOT** import `repository/postgres` directly — ONLY depend on `domain.<Interface>`.
+  - All business validation, transaction handling, and business calculations MUST live here, NEVER in handlers.
+
+### 3. Repository Layer (`services/*/internal/repository/postgres/`)
+- **Role:** Implements domain persistence interfaces using PostgreSQL and GORM.
+- **Rules:**
+  - 🚫 **MUST NOT** contain business logic. Its only job is CRUD on the service's own isolated database.
+  - 🚫 **MUST NEVER** connect to or query another service's database.
+
+### 4. Client Layer (`services/*/internal/client/`)
+- **Role:** Implements inter-service communication (REST HTTP with Redis cache, or gRPC).
+- **Rules:**
+  - Implements `domain.<ServiceClient>` interface to allow mocking in unit tests.
+  - Must include short timeouts, circuit breaker/fallback patterns, and pass `X-Trace-ID` for distributed tracing.
+
+### 5. Delivery Layer (`services/*/internal/delivery/`)
+- **Role:** Transport entry points (REST Fiber handlers and gRPC handlers).
+- **Rules:**
+  - 🚫 **MUST NOT** contain business logic.
+  - ✅ **DO** act as a thin adapter: Receive Request $\rightarrow$ Parse/Validate DTO $\rightarrow$ Call Service $\rightarrow$ Format JSON response via `pkg/response`.
+
+### 6. Shared Module (`pkg/`)
+- **Role:** Code shared across multiple microservices. Has its own `go.mod` (`ecomerce-service/pkg`).
+- Contains: `config/`, `kafka/`, `logger/`, `middlewares/`, `redislock/`, `response/`, `server/`.
+- Must remain clean, tested, and general-purpose.
+
+---
+
+## ⚡ 3. Distributed Transactions & Concurrency Rules
+
+1. **Database-per-Service:** Each service owns its database (`ecom_user_db`, `ecom_product_db`, `ecom_order_db`). Cross-database queries are STRICTLY FORBIDDEN.
+2. **100% Apache Kafka Event-Driven Backbone:**
+   - RabbitMQ is completely deprecated and removed. All asynchronous operations must use Kafka.
+   - Topics, Event Structs, and Consumer Groups must be registered in [pkg/kafka/topics.go](pkg/kafka/topics.go).
+   - Distributed transactions must follow **Saga Choreography** (Compensating transactions on failure).
+3. **High-Concurrency Stock Deductions:**
+   - Flash sale or high-traffic inventory operations must use the atomic Redis Lua lock in [pkg/redislock/redis_stock_lock.go](pkg/redislock/redis_stock_lock.go).
+4. **Idempotency:**
+   - Critical mutating endpoints (like checkout and order creation) must enforce the `Idempotency-Key` header via [pkg/middlewares/idempotency_middleware.go](pkg/middlewares/idempotency_middleware.go).
+
+---
+
+## 🔄 4. Mandatory Documentation Update Rule
+
+> [!IMPORTANT]
+> **MANDATORY FOR ALL AI AGENTS:**
+> Whenever you add, modify, or remove any:
+> - Microservice, port, or route
+> - Kafka topic or Saga event
+> - Database model or migration
+> - Architecture layer or shared module
+> 
+> You **MUST IMMEDIATELY UPDATE** both:
+> 1. [README.md](README.md): To ensure user documentation reflects the current state.
+> 2. [ARCHITECTURE.md](ARCHITECTURE.md): To ensure architectural diagrams and design decisions remain accurate.
+> 
+> Never leave documentation stale after making structural code changes.
