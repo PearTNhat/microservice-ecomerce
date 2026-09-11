@@ -1,0 +1,9 @@
+go 1.26.0
+
+use (
+	./pkg
+	./services/api-gateway
+	./services/order-service
+	./services/product-service
+	./services/user-service
+)

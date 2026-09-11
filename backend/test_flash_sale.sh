@@ -27,21 +27,19 @@ REG_RES=$(curl -s -X POST "${GATEWAY_URL}/register" \
   -H "Content-Type: application/json" \
   -d "{\"email\":\"${TEST_EMAIL}\",\"password\":\"${PASSWORD}\",\"first_name\":\"Flash\",\"last_name\":\"Tester\",\"phone\":\"0988776655\"}")
 
-# Đăng nhập trực tiếp hoặc verify
-TOKEN=$(curl -s -X POST "${GATEWAY_URL}/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"${TEST_EMAIL}\",\"password\":\"${PASSWORD}\"}" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
-
-# Fallback nếu cần xác thực qua admin
-if [ -z "$TOKEN" ]; then
-  # Dùng token admin mặc định nếu có
-  TOKEN=$(curl -s -X POST "${GATEWAY_URL}/login" \
+# Lấy OTP từ Redis và verify email
+OTP_CODE=$(docker exec ecom-redis redis-cli GET "verify:user:${TEST_EMAIL}" 2>/dev/null | grep -o '"otp":[0-9]*' | cut -d':' -f2)
+if [ -n "$OTP_CODE" ]; then
+  VERIFY_RESP=$(curl -s -X POST "${GATEWAY_URL}/verify-email" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@example.com","password":"AdminPassword123!"}' | grep -o '"token":"[^"]*' | cut -d'"' -f4)
+    -d "{\"email\":\"${TEST_EMAIL}\",\"code\":${OTP_CODE}}")
+  TOKEN=$(echo "$VERIFY_RESP" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
 fi
 
 if [ -z "$TOKEN" ]; then
-  echo -e "${RED}❌ Không thể lấy JWT Token để test. Đang tạo token tạm...${NC}"
+  TOKEN=$(curl -s -X POST "${GATEWAY_URL}/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"email\":\"${TEST_EMAIL}\",\"password\":\"${PASSWORD}\"}" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
 fi
 
 PRODUCT_ID=1

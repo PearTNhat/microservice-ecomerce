@@ -7,3 +7,10 @@ Mong mng có thể chỉ cho em hướng tiếp cận với bài toán để em 
 Em cũng muốn hỏi thêm là về SQL thì e nên tìm hiểu sâu hơn về phần nào?
 
 Tìm hiểu distributed transaction nhé, tiêu biểu có saga, 2pc, nên xem ưu nhược điểm mỗi loại
+
+
+
+gọi qua các service để thực hiện ví dụ order gọi qua user cần lam case đó để thực tế làm cho nhanh ?
+
+# Saga Choreography qua Kafka Topics
+

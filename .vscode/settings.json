@@ -4,5 +4,8 @@
     },
     "terminal.integrated.env.linux": {
         "GOROOT": null
+    },
+    "go.alternateTools": {
+        "go": "/home/nhat/.local/bin/go"
     }
 }

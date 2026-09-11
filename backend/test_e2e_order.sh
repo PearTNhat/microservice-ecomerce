@@ -52,33 +52,40 @@ REG_RESP=$(curl -s -w "\n%{http_code}" -X POST "${GATEWAY_URL}/register" \
   -H "Content-Type: application/json" \
   -d "$REG_BODY")
 REG_CODE=$(echo "$REG_RESP" | tail -n1)
-assert_status 201 "$REG_CODE" "Đăng ký tài khoản"
+assert_status 200 "$REG_CODE" "Đăng ký tài khoản (Nhận yêu cầu xác thực OTP)"
 
-# 3. Đăng nhập lấy Token
-echo -e "\n${YELLOW}3. Đăng nhập lấy JWT Access Token...${NC}"
-LOGIN_BODY=$(cat <<EOF
+# 2.1. Lấy OTP từ Redis và xác thực tài khoản
+OTP_CODE=$(docker exec ecom-redis redis-cli GET "verify:user:${TEST_EMAIL}" 2>/dev/null | grep -o '"otp":[0-9]*' | cut -d':' -f2)
+if [ -n "$OTP_CODE" ]; then
+    echo -e "  [${GREEN}INFO${NC}] Mã OTP từ Redis: ${OTP_CODE}"
+    VERIFY_RESP=$(curl -s -X POST "${GATEWAY_URL}/verify-email" \
+      -H "Content-Type: application/json" \
+      -d "{\"email\":\"${TEST_EMAIL}\",\"code\":${OTP_CODE}}")
+    TOKEN=$(echo "$VERIFY_RESP" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
+fi
+
+# 3. Đăng nhập lấy Token (hoặc dùng token từ Verify)
+if [ -z "$TOKEN" ]; then
+    echo -e "\n${YELLOW}3. Đăng nhập lấy JWT Access Token...${NC}"
+    LOGIN_BODY=$(cat <<EOF
 {
   "email": "${TEST_EMAIL}",
   "password": "${TEST_PASSWORD}"
 }
 EOF
 )
-LOGIN_RESP=$(curl -s -w "\n%{http_code}" -X POST "${GATEWAY_URL}/login" \
-  -H "Content-Type: application/json" \
-  -d "$LOGIN_BODY")
-LOGIN_CODE=$(echo "$LOGIN_RESP" | tail -n1)
-LOGIN_JSON=$(echo "$LOGIN_RESP" | sed '$d')
-
-TOKEN=$(echo "$LOGIN_JSON" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
-if [ -z "$TOKEN" ]; then
-    # Thử parse data.access_token
+    LOGIN_RESP=$(curl -s -w "\n%{http_code}" -X POST "${GATEWAY_URL}/login" \
+      -H "Content-Type: application/json" \
+      -d "$LOGIN_BODY")
+    LOGIN_JSON=$(echo "$LOGIN_RESP" | sed '$d')
     TOKEN=$(echo "$LOGIN_JSON" | grep -o '"token":"[^"]*' | cut -d'"' -f4)
 fi
 
 if [ -n "$TOKEN" ]; then
-    echo -e "  [${GREEN}PASS${NC}] Đăng nhập thành công, nhận JWT Token"
+    echo -e "  [${GREEN}PASS${NC}] Nhận JWT Token thành công!"
 else
-    echo -e "  [${RED}FAIL${NC}] Không lấy được JWT Token: $LOGIN_JSON"
+    echo -e "  [${RED}FAIL${NC}] Không lấy được JWT Token"
+    exit 1
 fi
 
 # 4. Lấy danh sách sản phẩm từ Product Service

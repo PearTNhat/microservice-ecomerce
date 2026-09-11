@@ -3,7 +3,6 @@ package elasticsearch
 import (
 	"bytes"
 	"context"
-	"ecomerce-service/internal/core/domain"
 	"ecomerce-service/pkg/logger"
 	"encoding/json"
 	"fmt"
@@ -30,7 +29,7 @@ type ProductDocument struct {
 }
 
 type SearchClient interface {
-	IndexProduct(ctx context.Context, p *domain.Product) error
+	IndexProduct(ctx context.Context, doc *ProductDocument) error
 	SearchProducts(ctx context.Context, keyword string, minPrice, maxPrice float64, limit int) ([]uint, error)
 	Close() error
 }
@@ -115,25 +114,13 @@ func (e *esClientImpl) initIndex() {
 	logger.Info("✅ Đã khởi tạo Elasticsearch index 'products' thành công!")
 }
 
-func (e *esClientImpl) IndexProduct(ctx context.Context, p *domain.Product) error {
-	doc := ProductDocument{
-		ID:             p.ID,
-		Name:           p.Name,
-		Slug:           p.Slug,
-		Description:    p.Description,
-		Price:          p.Price,
-		DiscountPrice:  p.DiscountPrice,
-		CategoryID:     p.CategoryID,
-		BrandID:        p.BrandID,
-		Specifications: p.Specifications,
-	}
-
+func (e *esClientImpl) IndexProduct(ctx context.Context, doc *ProductDocument) error {
 	data, err := json.Marshal(doc)
 	if err != nil {
 		return err
 	}
 
-	docID := strconv.Itoa(int(p.ID))
+	docID := strconv.Itoa(int(doc.ID))
 	res, err := e.client.Index(
 		ProductIndex,
 		bytes.NewReader(data),
@@ -249,7 +236,7 @@ func (e *esClientImpl) Close() error {
 // noopSearchClient cho fallback và unit tests
 type noopSearchClient struct{}
 
-func (n *noopSearchClient) IndexProduct(ctx context.Context, p *domain.Product) error {
+func (n *noopSearchClient) IndexProduct(ctx context.Context, doc *ProductDocument) error {
 	return nil
 }
 

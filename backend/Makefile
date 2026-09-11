@@ -6,20 +6,20 @@ run-all:
 
 # Chạy từng Microservice độc lập
 run-gateway:
-	go run cmd/api-gateway/main.go
+	go run services/api-gateway/cmd/main.go
 
 run-user:
-	go run cmd/user-service/main.go
+	go run services/user-service/cmd/main.go
 
 run-product:
-	go run cmd/product-service/main.go
+	go run services/product-service/cmd/main.go
 
 run-order:
-	go run cmd/order-service/main.go
+	go run services/order-service/cmd/main.go
 
 # Chạy kiểm thử tự động
 test:
-	go test -v ./...
+	go test ./services/api-gateway/... ./services/user-service/... ./services/product-service/... ./services/order-service/... ./pkg/...
 
 test-e2e:
 	./test_e2e_order.sh
@@ -30,15 +30,11 @@ test-flash-sale:
 # Biên dịch tất cả binaries
 build-all:
 	@mkdir -p bin
-	go build -o bin/api-gateway ./cmd/api-gateway
-	go build -o bin/user-service ./cmd/user-service
-	go build -o bin/product-service ./cmd/product-service
-	go build -o bin/order-service ./cmd/order-service
+	go build -o bin/api-gateway ./services/api-gateway/cmd/main.go
+	go build -o bin/user-service ./services/user-service/cmd/main.go
+	go build -o bin/product-service ./services/product-service/cmd/main.go
+	go build -o bin/order-service ./services/order-service/cmd/main.go
 	@echo "✅ Đã build thành công 4 Microservices vào thư mục bin/!"
-
-# Sinh mã Protobuf cho gRPC
-proto:
-	protoc --go_out=. --go-grpc_out=. api/proto/*.proto
 
 # Khởi động hạ tầng Docker
 run-docker:
