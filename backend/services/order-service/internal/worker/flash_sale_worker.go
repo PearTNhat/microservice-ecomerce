@@ -2,36 +2,43 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
 	"ecomerce-service/pkg/config"
+	pkgKafka "ecomerce-service/pkg/kafka"
 	"ecomerce-service/pkg/logger"
 	"ecomerce-service/pkg/redislock"
 	"ecomerce-service/services/order-service/internal/client"
 	"ecomerce-service/services/order-service/internal/domain"
 	"ecomerce-service/services/order-service/internal/dto"
-	pkgKafka "ecomerce-service/pkg/kafka"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"strings"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
+	"gorm.io/gorm"
 )
 
 type FlashSaleWorker struct {
-	reader        *kafka.Reader
-	orderRepo     domain.OrderRepository
-	productClient client.ProductClient
-	redisClient   *redis.Client
-	kafkaProducer pkgKafka.OrderKafkaProducer
-	appConfig     config.AppConfig
+	reader             *kafka.Reader
+	db                 *gorm.DB
+	orderRepo          domain.OrderRepository
+	fsRepo             domain.FlashSaleRepository
+	processedEventRepo domain.ProcessedEventRepository
+	productClient      client.ProductClient
+	redisClient        *redis.Client
+	kafkaProducer      pkgKafka.OrderKafkaProducer
+	appConfig          config.AppConfig
 }
 
 func NewFlashSaleWorker(
 	brokers []string,
 	cfg config.AppConfig,
+	db *gorm.DB,
 	orderRepo domain.OrderRepository,
+	fsRepo domain.FlashSaleRepository,
+	processedEventRepo domain.ProcessedEventRepository,
 	productClient client.ProductClient,
 	redisClient *redis.Client,
 	producer pkgKafka.OrderKafkaProducer,
@@ -50,22 +57,24 @@ func NewFlashSaleWorker(
 	})
 
 	return &FlashSaleWorker{
-		reader:        reader,
-		orderRepo:     orderRepo,
-		productClient: productClient,
-		redisClient:   redisClient,
-		kafkaProducer: producer,
-		appConfig:     cfg,
+		reader:             reader,
+		db:                 db,
+		orderRepo:          orderRepo,
+		fsRepo:             fsRepo,
+		processedEventRepo: processedEventRepo,
+		productClient:      productClient,
+		redisClient:        redisClient,
+		kafkaProducer:      producer,
+		appConfig:          cfg,
 	}
 }
 
-// Start lắng nghe và xử lý các tác vụ tạo đơn Flash Sale từ Kafka (Cắt đỉnh tải)
 func (w *FlashSaleWorker) Start(ctx context.Context) {
 	if w.reader == nil {
 		return
 	}
 
-	logger.Info("⚡ [KAFKA FLASH SALE WORKER] Đang lắng nghe topic flashsale.orders...",
+	logger.Info("⚡ [KAFKA FLASH SALE WORKER] Đang lắng nghe topic flashsale.orders với Idempotent Consumer...",
 		"group_id", pkgKafka.ConsumerGroupFlashSale,
 	)
 
@@ -93,29 +102,68 @@ func (w *FlashSaleWorker) Start(ctx context.Context) {
 	}()
 }
 
+type flashSaleTaskPayload struct {
+	ReservationID   string  `json:"reservation_id"`
+	RequestID       string  `json:"request_id"`
+	CampaignID      uint    `json:"campaign_id"`
+	ProductID       uint    `json:"product_id"`
+	UserID          string  `json:"user_id"`
+	Quantity        int     `json:"quantity"`
+	UnitPrice       float64 `json:"unit_price"`
+	TotalAmount     float64 `json:"total_amount"`
+	PaymentMethod   string  `json:"payment_method"`
+	CustomerName    string  `json:"customer_name"`
+	CustomerEmail   string  `json:"customer_email"`
+	CustomerPhone   string  `json:"customer_phone"`
+	ShippingAddress string  `json:"shipping_address"`
+	TraceID         string  `json:"trace_id"`
+}
+
 func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Message) {
-	var task pkgKafka.FlashSaleOrderTaskPayload
+	var task flashSaleTaskPayload
 	if err := json.Unmarshal(m.Value, &task); err != nil {
 		logger.Error("❌ FlashSaleWorker: Lỗi deserialize JSON payload", "error", err.Error())
-		if w.kafkaProducer != nil {
-			_ = w.kafkaProducer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, err.Error(), "")
-		}
 		return
 	}
 
 	traceID := task.TraceID
 	if traceID == "" {
-		traceID = "fs-worker-" + task.OrderToken
+		traceID = "fs-worker-" + task.ReservationID
 	}
 	reqCtx := logger.SetTraceID(ctx, traceID)
 
-	logger.InfoContext(reqCtx, "⚡ [FLASH SALE WORKER] Bắt đầu ghi đơn hàng vào PostgreSQL ecom_order_db",
-		"order_token", task.OrderToken,
-		"user_id", task.UserID,
-		"product_id", task.ProductID,
-	)
+	// 1. Idempotency Check với processed_events
+	eventID := fmt.Sprintf("fs-order-%s", task.ReservationID)
+	if w.processedEventRepo != nil {
+		processed, err := w.processedEventRepo.HasProcessed("flash-sale-worker", eventID)
+		if err == nil && processed {
+			logger.InfoContext(reqCtx, "🔁 [IDEMPOTENT] Sự kiện Flash Sale đã được xử lý trước đó, bỏ qua",
+				"reservation_id", task.ReservationID,
+			)
+			return
+		}
+	}
 
-	// Lấy thông tin sản phẩm qua ProductClient (Không đụng trực tiếp Product DB)
+	// 2. Kiểm tra trạng thái hiện tại của Reservation trong DB
+	resv, err := w.fsRepo.FindReservationByID(task.ReservationID)
+	if err != nil {
+		logger.ErrorContext(reqCtx, "❌ FlashSaleWorker: Không tìm thấy reservation trong DB",
+			"reservation_id", task.ReservationID,
+			"error", err.Error(),
+		)
+		return
+	}
+
+	if resv.Status == domain.ReservationStatusConfirmed {
+		logger.InfoContext(reqCtx, "Đơn Flash Sale đã được CONFIRMED trước đó", "reservation_id", task.ReservationID)
+		return
+	}
+	if resv.Status == domain.ReservationStatusCancelled || resv.Status == domain.ReservationStatusExpired {
+		logger.WarnContext(reqCtx, "Reservation đã bị CANCELLED/EXPIRED, hủy xử lý", "reservation_id", task.ReservationID)
+		return
+	}
+
+	// 3. Lấy thông tin sản phẩm qua ProductClient
 	var name, slug, thumbnail string
 	if w.productClient != nil {
 		prod, err := w.productClient.GetProduct(reqCtx, task.ProductID)
@@ -129,17 +177,15 @@ func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Mes
 		name = fmt.Sprintf("Sản phẩm Flash Sale #%d", task.ProductID)
 	}
 
-	subtotal := task.Price * float64(task.Quantity)
-	orderCode := fmt.Sprintf("ORD-FS-%s", strings.ToUpper(task.OrderToken[len(task.OrderToken)-8:]))
-
+	orderCode := fmt.Sprintf("ORD-FS-%s", strings.ToUpper(task.ReservationID[len(task.ReservationID)-8:]))
 	orderItem := domain.OrderItem{
 		ProductID:   task.ProductID,
 		ProductName: name,
 		ProductSlug: slug,
 		Thumbnail:   thumbnail,
-		Price:       task.Price,
+		Price:       task.UnitPrice,
 		Quantity:    task.Quantity,
-		Subtotal:    subtotal,
+		Subtotal:    task.TotalAmount,
 	}
 
 	order := &domain.Order{
@@ -149,64 +195,74 @@ func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Mes
 		CustomerEmail:   task.CustomerEmail,
 		CustomerPhone:   task.CustomerPhone,
 		ShippingAddress: task.ShippingAddress,
-		Note:            fmt.Sprintf("Đơn hàng Flash Sale (Token: %s)", task.OrderToken),
+		Note:            fmt.Sprintf("Đơn hàng Flash Sale (Mã giữ chỗ: %s)", task.ReservationID),
 		PaymentMethod:   task.PaymentMethod,
 		PaymentStatus:   domain.PaymentStatusPending,
 		OrderStatus:     domain.OrderStatusPending,
-		TotalAmount:     subtotal,
+		TotalAmount:     task.TotalAmount,
 		Items:           []domain.OrderItem{orderItem},
 	}
 
-	// Ghi đơn hàng vào PostgreSQL ecom_order_db
-	var err error
-	if strings.Contains(task.CustomerName, "[TEST_FAIL]") {
-		err = errors.New("mô phỏng sự cố Database: hệ thống đã kích hoạt Rollback tự động hoàn trả tồn kho")
-	} else {
-		err = w.orderRepo.CreateOrder(order)
-	}
+	// 4. THỰC THI GIAO DỊCH DATABASE BẢO ĐẢM TÍNH BỀN VỮNG (DURABLE ATOMIC TRANSACTION)
+	dbErr := w.db.Transaction(func(tx *gorm.DB) error {
+		// a. Đánh dấu đã xử lý vào processed_events
+		if w.processedEventRepo != nil {
+			if err := w.processedEventRepo.MarkProcessed(tx, "flash-sale-worker", eventID); err != nil {
+				return err
+			}
+		}
 
-	if err != nil {
-		logger.ErrorContext(reqCtx, "❌ FlashSaleWorker: Ghi Database thất bại, hoàn lại tồn kho Redis",
-			"order_token", task.OrderToken,
-			"error", err.Error(),
+		// b. Tạo Order và OrderItem
+		if err := tx.Create(order).Error; err != nil {
+			return err
+		}
+
+		// c. Confirm Reservation trong DB (CAS chuyển RESERVED -> CONFIRMED, chuyển reserved_stock -> sold_stock)
+		if err := w.fsRepo.ConfirmReservationDB(tx, task.ReservationID, order.ID); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if dbErr != nil {
+		logger.ErrorContext(reqCtx, "❌ FlashSaleWorker: Lưu đơn hàng thất bại",
+			"reservation_id", task.ReservationID,
+			"error", dbErr.Error(),
 		)
-
-		// Hoàn lại kho trên Redis
-		_ = redislock.RevertFlashSaleStockAtomic(reqCtx, w.redisClient, task.ProductID, task.UserID, task.Quantity)
-
-		// Cập nhật trạng thái FAILED vào Redis
-		failedStatus := dto.FlashSaleStatusResponse{
-			OrderToken: task.OrderToken,
-			Status:     "FAILED",
-			Reason:     "Lỗi lưu trữ đơn hàng: " + err.Error(),
-			UpdatedAt:  time.Now().Format(time.RFC3339),
-		}
-		failedJSON, _ := json.Marshal(failedStatus)
-		_ = redislock.SetFlashSaleOrderStatus(reqCtx, w.redisClient, task.OrderToken, string(failedJSON), 15*time.Minute)
-
-		if w.kafkaProducer != nil {
-			_ = w.kafkaProducer.PublishDeadLetter(reqCtx, m.Topic, task.OrderToken, m.Value, err.Error(), traceID)
-		}
+		// Hoàn lại kho trên Redis nếu lỗi nghiệp vụ DB
+		_, _ = redislock.ReleaseFlashSaleReservation(reqCtx, w.redisClient, task.CampaignID, task.ProductID, task.ReservationID, "CANCELLED")
 		return
 	}
 
-	// Ghi DB thành công -> Cập nhật trạng thái SUCCESS vào Redis
-	successStatus := dto.FlashSaleStatusResponse{
-		OrderToken: task.OrderToken,
-		Status:     "SUCCESS",
-		OrderID:    order.ID,
-		OrderCode:  order.OrderCode,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	successJSON, _ := json.Marshal(successStatus)
-	_ = redislock.SetFlashSaleOrderStatus(reqCtx, w.redisClient, task.OrderToken, string(successJSON), 15*time.Minute)
+	// 5. SAU KHI DB COMMIT THÀNH CÔNG: ĐỒNG BỘ SANG REDIS VÀ THÔNG BÁO CLIENT
+	// a. Gọi Confirm trên Redis
+	if w.redisClient != nil {
+		_, _ = redislock.ConfirmFlashSaleReservation(reqCtx, w.redisClient, task.CampaignID, task.ProductID, task.ReservationID)
 
-	logger.InfoContext(reqCtx, "✅ [FLASH SALE WORKER] Lưu đơn hàng thành công, bắn event order.created sang Kafka",
+		// b. Cập nhật Status Snapshot trên Redis
+		statusSnapshot := dto.FlashSaleOrderStatusResponse{
+			ReservationID: task.ReservationID,
+			Status:        "CONFIRMED",
+			OrderID:       &order.ID,
+			OrderCode:     order.OrderCode,
+			ExpiresAt:     resv.ExpiresAt,
+			UpdatedAt:     time.Now(),
+		}
+		statusJSON, _ := json.Marshal(statusSnapshot)
+		_ = w.redisClient.Set(reqCtx, redislock.KeyOrderStatus(task.ReservationID), string(statusJSON), 24*time.Hour)
+
+		// c. Phát Pub/Sub thông báo cho SSE Client đang mở kết nối
+		_ = w.redisClient.Publish(reqCtx, fmt.Sprintf("pubsub:order-status:%s", task.ReservationID), string(statusJSON))
+	}
+
+	logger.InfoContext(reqCtx, "✅ [FLASH SALE WORKER] Lưu đơn hàng thành công, bắn event order.created (IsFlashSale=true) sang Kafka",
 		"order_id", order.ID,
 		"order_code", order.OrderCode,
+		"reservation_id", task.ReservationID,
 	)
 
-	// Bắn event order.created sang Kafka để kích hoạt ProductStockWorker trừ kho DB và EmailWorker gửi mail
+	// 6. Bắn event order.created sang Kafka với cờ IsFlashSale = true (để ProductStockWorker không trừ kho lần 2)
 	if w.kafkaProducer != nil {
 		_ = w.kafkaProducer.PublishOrderCreated(reqCtx, pkgKafka.OrderCreatedPayload{
 			EventType:       pkgKafka.EventOrderCreated,
@@ -219,6 +275,9 @@ func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Mes
 			ShippingAddress: order.ShippingAddress,
 			TotalAmount:     order.TotalAmount,
 			PaymentMethod:   order.PaymentMethod,
+			IsFlashSale:     true,
+			CampaignID:      &task.CampaignID,
+			ReservationID:   task.ReservationID,
 			Items: []pkgKafka.OrderItemPayload{
 				{
 					ProductID:   orderItem.ProductID,

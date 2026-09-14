@@ -48,11 +48,12 @@ func main() {
 	// 4. Khởi tạo REST Server & DB (Dùng riêng database ecom_product_db)
 	srv := server.NewServer(appConfig)
 
-	// AutoMigrate bảng Category, Brand, Product
+	// AutoMigrate bảng Category, Brand, Product, ProductStockAllocation
 	err := srv.DB.AutoMigrate(
 		&domain.Category{},
 		&domain.Brand{},
 		&domain.Product{},
+		&domain.ProductStockAllocation{},
 	)
 	if err != nil {
 		logger.Error("❌ Lỗi AutoMigrate Product/Category/Brand", "error", err.Error())
@@ -70,6 +71,7 @@ func main() {
 	// 6. Khởi tạo Repositories & Services
 	productRepo := repository.NewProductRepository(srv.DB)
 	productService := service.NewProductService(productRepo, importRedis, kafkaViewProducer, esClient)
+	stockAllocRepo := repository.NewStockAllocationRepository(srv.DB)
 
 	// 7. Khởi chạy các Kafka Consumer Workers
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,6 +97,7 @@ func main() {
 		Config: appConfig,
 	}
 	http_handlers.SetupProductRoutes(rh, productService)
+	http_handlers.SetupInternalStockRoutes(rh, stockAllocRepo)
 
 	// 9. Chạy REST Server ở luồng chính
 	srv.Start()

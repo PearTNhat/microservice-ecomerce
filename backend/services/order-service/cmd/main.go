@@ -51,15 +51,20 @@ func main() {
 	// 3. Khởi tạo REST Server & DB (CHỈ DÙNG DUY NHẤT database ecom_order_db)
 	srv := server.NewServer(appConfig)
 
-	// AutoMigrate bảng Cart, CartItem, Order, OrderItem
+	// AutoMigrate bảng Cart, CartItem, Order, OrderItem, Flash Sale entities
 	err := srv.DB.AutoMigrate(
 		&domain.Cart{},
 		&domain.CartItem{},
 		&domain.Order{},
 		&domain.OrderItem{},
+		&domain.FlashSaleCampaign{},
+		&domain.FlashSaleItem{},
+		&domain.FlashSaleReservation{},
+		&domain.OutboxEvent{},
+		&domain.ProcessedEvent{},
 	)
 	if err != nil {
-		logger.Error("❌ Lỗi AutoMigrate Cart/CartItem/Order/OrderItem", "error", err.Error())
+		logger.Error("❌ Lỗi AutoMigrate Order/FlashSale", "error", err.Error())
 	}
 
 	// 4. Khởi tạo Apache Kafka Order Event Producer
@@ -73,11 +78,15 @@ func main() {
 	// 6. Khởi tạo Repositories & Services
 	cartRepo := repository.NewCartRepository(srv.DB)
 	orderRepo := repository.NewOrderRepository(srv.DB)
+	fsRepo := repository.NewFlashSaleRepository(srv.DB)
+	outboxRepo := repository.NewOutboxRepository(srv.DB)
+	processedEventRepo := repository.NewProcessedEventRepository(srv.DB)
 
 	cartService := service.NewCartService(cartRepo, productClient)
 	orderService := service.NewOrderService(orderRepo, cartRepo, productClient, importRedis, orderKafkaProducer)
+	flashSaleService := service.NewFlashSaleService(fsRepo, productClient, importRedis)
 
-	// 7. Khởi chạy các Kafka Consumer Workers (Event-Driven Concurrency)
+	// 7. Khởi chạy các Kafka Consumer & Background Workers
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,14 +97,26 @@ func main() {
 		defer emailWorker.Close()
 	}
 
-	// 7.2. Flash Sale Worker (Lắng nghe flashsale.orders để cắt đỉnh tải tạo đơn)
-	flashSaleWorker := worker.NewFlashSaleWorker(kafkaBrokers, appConfig, orderRepo, productClient, importRedis, orderKafkaProducer)
+	// 7.2. Outbox Publisher Worker (Quét outbox_events bắn Kafka với lease lock)
+	outboxWorker := worker.NewOutboxPublisherWorker(outboxRepo, orderKafkaProducer, "order-service-outbox-1")
+	outboxWorker.Start(ctx)
+
+	// 7.3. Flash Sale Worker (Lắng nghe flashsale.orders để cắt đỉnh tải tạo đơn)
+	flashSaleWorker := worker.NewFlashSaleWorker(kafkaBrokers, appConfig, srv.DB, orderRepo, fsRepo, processedEventRepo, productClient, importRedis, orderKafkaProducer)
 	if flashSaleWorker != nil {
 		flashSaleWorker.Start(ctx)
 		defer flashSaleWorker.Close()
 	}
 
-	// 7.3. Order Saga Worker (Lắng nghe stock.events từ Product Service để Confirm/Cancel đơn hàng)
+	// 7.4. Reservation Expiry Worker (Quét reservation quá hạn nhả kho)
+	expiryWorker := worker.NewReservationExpiryWorker(srv.DB, fsRepo, importRedis)
+	expiryWorker.Start(ctx)
+
+	// 7.5. Reconciliation Worker (Đối soát và dọn dẹp Ghost Reservation)
+	reconWorker := worker.NewReconciliationWorker(srv.DB, fsRepo, importRedis)
+	reconWorker.Start(ctx)
+
+	// 7.6. Order Saga Worker (Lắng nghe stock.events từ Product Service để Confirm/Cancel đơn hàng)
 	orderSagaWorker := worker.NewOrderSagaWorker(kafkaBrokers, orderRepo, importRedis, orderKafkaProducer)
 	if orderSagaWorker != nil {
 		orderSagaWorker.Start(ctx)
@@ -109,6 +130,7 @@ func main() {
 	}
 	http_handlers.SetupCartRoutes(rh, cartService)
 	http_handlers.SetupOrderRoutes(rh, orderService, importRedis)
+	http_handlers.SetupFlashSaleRoutes(rh, flashSaleService, importRedis)
 
 	// 9. Chạy REST Server ở luồng chính
 	srv.Start()

@@ -18,6 +18,7 @@ type OrderKafkaProducer interface {
 	PublishFlashSaleOrderTask(ctx context.Context, payload FlashSaleOrderTaskPayload) error
 	PublishStockResult(ctx context.Context, payload StockResultPayload) error
 	PublishDeadLetter(ctx context.Context, originalTopic string, key string, rawPayload []byte, errReason string, traceID string) error
+	PublishRaw(ctx context.Context, topic string, key string, payload []byte) error
 	Close() error
 }
 
@@ -273,6 +274,31 @@ func (p *orderKafkaProducer) PublishDeadLetter(ctx context.Context, originalTopi
 	return w.WriteMessages(ctx, msg)
 }
 
+func (p *orderKafkaProducer) PublishRaw(ctx context.Context, topic string, key string, payload []byte) error {
+	w, ok := p.writers[topic]
+	if !ok {
+		// Tạo dynamically writer nếu topic mới
+		w = &kafka.Writer{
+			Addr:                   kafka.TCP(p.brokers...),
+			Topic:                  topic,
+			Balancer:               &kafka.Hash{},
+			BatchTimeout:           10 * time.Millisecond,
+			Async:                  false,
+			AllowAutoTopicCreation: true,
+			RequiredAcks:           kafka.RequireOne,
+		}
+		p.writers[topic] = w
+	}
+
+	msg := kafka.Message{
+		Key:   []byte(key),
+		Value: payload,
+		Time:  time.Now(),
+	}
+
+	return w.WriteMessages(ctx, msg)
+}
+
 func (p *orderKafkaProducer) Close() error {
 	for _, w := range p.writers {
 		if w != nil {
@@ -301,6 +327,9 @@ func (n *noopOrderKafkaProducer) PublishStockResult(ctx context.Context, payload
 	return nil
 }
 func (n *noopOrderKafkaProducer) PublishDeadLetter(ctx context.Context, originalTopic string, key string, rawPayload []byte, errReason string, traceID string) error {
+	return nil
+}
+func (n *noopOrderKafkaProducer) PublishRaw(ctx context.Context, topic string, key string, payload []byte) error {
 	return nil
 }
 func (n *noopOrderKafkaProducer) Close() error {

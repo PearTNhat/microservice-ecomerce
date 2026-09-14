@@ -122,6 +122,14 @@ func (w *ProductStockWorker) processMessage(ctx context.Context, m kafka.Message
 		"items_count", len(payload.Items),
 	)
 
+	if payload.IsFlashSale {
+		logger.InfoContext(reqCtx, "⚡ [FLASH SALE] Bỏ qua trừ tồn kho thường vì đơn hàng đã được phân bổ tồn kho Flash Sale",
+			"order_id", payload.OrderID,
+			"campaign_id", payload.CampaignID,
+		)
+		return
+	}
+
 	var deductedItems []pkgKafka.OrderItemPayload
 	var deductErr error
 

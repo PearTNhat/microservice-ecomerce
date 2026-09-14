@@ -144,6 +144,10 @@ func main() {
 		"/cart/*",
 		"/orders",
 		"/orders/*",
+		"/flash-sales",
+		"/flash-sales/*",
+		"/admin/flash-sales",
+		"/admin/flash-sales/*",
 	}
 	for _, route := range orderRoutes {
 		app.All(route, proxyTo(orderServiceURL))

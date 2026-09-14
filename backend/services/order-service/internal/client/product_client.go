@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,6 +16,8 @@ import (
 // ProductClient interface cho các service khác gọi sang Product Service mà không cần đụng DB
 type ProductClient interface {
 	GetProduct(ctx context.Context, productID uint) (*dto.ProductDetailResponse, error)
+	AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error
+	ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error
 }
 
 type productClient struct {
@@ -101,3 +104,64 @@ func (c *productClient) GetProduct(ctx context.Context, productID uint) (*dto.Pr
 
 	return apiResp.Data, nil
 }
+
+func (c *productClient) AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error {
+	reqURL := fmt.Sprintf("%s/internal/stock-allocations", c.baseURL)
+	body := fmt.Sprintf(`{"campaign_id":%d,"product_id":%d,"quantity":%d}`, campaignID, productID, quantity)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", requestID)
+	if traceID := logger.GetTraceID(ctx); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("không thể kết nối tới Product Service (%s): %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return fmt.Errorf("lỗi allocate từ Product Service (HTTP %d): %s", resp.StatusCode, errResp.Message)
+	}
+
+	return nil
+}
+
+func (c *productClient) ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error {
+	reqURL := fmt.Sprintf("%s/internal/stock-allocations/%d/%d/release", c.baseURL, campaignID, productID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Idempotency-Key", requestID)
+	if traceID := logger.GetTraceID(ctx); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("không thể kết nối tới Product Service (%s): %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return fmt.Errorf("lỗi release từ Product Service (HTTP %d): %s", resp.StatusCode, errResp.Message)
+	}
+
+	return nil
+}
+

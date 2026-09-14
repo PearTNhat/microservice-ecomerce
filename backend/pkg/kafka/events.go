@@ -26,6 +26,9 @@ type OrderCreatedPayload struct {
 	TotalAmount     float64            `json:"total_amount"`
 	PaymentMethod   string             `json:"payment_method"`
 	Items           []OrderItemPayload `json:"items"`
+	IsFlashSale     bool               `json:"is_flash_sale,omitempty"`
+	CampaignID      *uint              `json:"campaign_id,omitempty"`
+	ReservationID   string             `json:"reservation_id,omitempty"`
 	TraceID         string             `json:"trace_id,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 }

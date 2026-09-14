@@ -302,6 +302,14 @@ func (m *mockProductClient) GetProduct(ctx context.Context, productID uint) (*dt
 	return p, nil
 }
 
+func (m *mockProductClient) AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error {
+	return nil
+}
+
+func (m *mockProductClient) ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error {
+	return nil
+}
+
 func TestOrderService_MultiItemRollback_WhenOneItemFails(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {

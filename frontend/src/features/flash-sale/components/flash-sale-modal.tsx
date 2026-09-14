@@ -2,7 +2,8 @@
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { orderService } from "@/features/orders/services/order-service";
+import { ActiveCampaignItem } from "@/features/flash-sale/types";
+import { flashSaleService } from "@/features/flash-sale/services/flash-sale-service";
 import { PaymentMethod } from "@/features/orders/types";
 import { Product } from "@/features/products/types";
 import { formatPrice } from "@/lib/utils";
@@ -13,7 +14,10 @@ import {
   CreditCard,
   Flame,
   Loader2,
+  Minus,
   PackageCheck,
+  Plus,
+  Radio,
   ShieldCheck,
   Sparkles,
   Truck,
@@ -22,10 +26,12 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 interface FlashSaleModalProps {
-  product: Product | null;
+  campaignId?: number | null;
+  item?: ActiveCampaignItem | null;
+  product?: Product | null;
   isOpen: boolean;
   onClose: () => void;
 }
@@ -33,16 +39,25 @@ interface FlashSaleModalProps {
 type ModalState = "FORM" | "QUEUED" | "SUCCESS" | "FAILED";
 
 export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
+  campaignId,
+  item,
   product,
   isOpen,
   onClose,
 }) => {
   const [state, setState] = useState<ModalState>("FORM");
-  const [orderToken, setOrderToken] = useState<string>("");
+  const [reservationId, setReservationId] = useState<string>("");
   const [createdOrderCode, setCreatedOrderCode] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [pollCount, setPollCount] = useState(0);
+  const [streamActive, setStreamActive] = useState(false);
+
+  // Quantity selection
+  const maxAllowedQty = item?.max_quantity_per_user
+    ? item.max_quantity_per_user
+    : 1;
+  const [quantity, setQuantity] = useState(1);
 
   // Form Fields
   const [formData, setFormData] = useState({
@@ -53,16 +68,34 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
     payment_method: "COD" as PaymentMethod,
   });
 
-  const [testMode, setTestMode] = useState<"SUCCESS" | "FAIL">("SUCCESS");
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  // Unified Product Information (from ActiveCampaignItem or fallback Product)
+  const displayInfo = {
+    id: item ? item.product_id : product?.id || 0,
+    name: item ? item.product_name : product?.name || "",
+    thumbnail: item?.product_thumbnail || product?.thumbnail || "/placeholder.png",
+    currentPrice: item ? item.sale_price : product?.discount_price || product?.price || 0,
+    originalPrice: item ? item.original_price : product?.price || 0,
+    discountPercent: item
+      ? item.discount_percentage
+      : product && product.discount_price && product.discount_price < product.price
+      ? Math.round(((product.price - product.discount_price) / product.price) * 100)
+      : 30,
+    stockLeft: item ? item.remaining_stock : product?.stock || 0,
+    isOneTimeDeal: item ? item.max_quantity_per_user === 1 : true,
+  };
 
   // Pre-fill user data from localStorage
   useEffect(() => {
     if (isOpen) {
       setState("FORM");
       setErrorMessage("");
-      setOrderToken("");
+      setReservationId("");
       setCreatedOrderCode("");
       setPollCount(0);
+      setStreamActive(false);
+      setQuantity(1);
 
       const userStr = localStorage.getItem("user_info");
       if (userStr) {
@@ -71,7 +104,8 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
           if (u) {
             setFormData((prev) => ({
               ...prev,
-              customer_name: `${u.first_name || ""} ${u.last_name || ""}`.trim() || prev.customer_name,
+              customer_name:
+                `${u.first_name || ""} ${u.last_name || ""}`.trim() || prev.customer_name,
               customer_email: u.email || prev.customer_email,
               customer_phone: u.phone || prev.customer_phone,
             }));
@@ -79,33 +113,84 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
         } catch (e) {}
       }
     }
-  }, [isOpen, product]);
 
-  // Polling effect when state == "QUEUED"
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, [isOpen, item, product]);
+
+  // Realtime SSE Stream + Polling Fallback when state == "QUEUED"
   useEffect(() => {
-    if (state !== "QUEUED" || !orderToken) return;
+    if (state !== "QUEUED" || !reservationId) return;
 
     let timer: NodeJS.Timeout;
     let attempts = 0;
-    const maxAttempts = 30; // 30 seconds max
+    const maxAttempts = 30; // 30s timeout
 
-    const checkStatus = async () => {
+    // 1. Mở kết nối SSE Stream
+    const es = flashSaleService.createOrderStatusEventSource(reservationId);
+    if (es) {
+      eventSourceRef.current = es;
+      setStreamActive(true);
+
+      es.addEventListener("snapshot", (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          handleStatusUpdate(data);
+        } catch (err) {}
+      });
+
+      es.addEventListener("status", (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          handleStatusUpdate(data);
+        } catch (err) {}
+      });
+
+      es.onerror = () => {
+        setStreamActive(false);
+        es.close();
+      };
+    }
+
+    const handleStatusUpdate = (statusData: any) => {
+      if (statusData?.status === "CONFIRMED") {
+        setCreatedOrderCode(statusData.order_code || (statusData.order_id ? `ORD-${statusData.order_id}` : reservationId));
+        setState("SUCCESS");
+        if (eventSourceRef.current) {
+          eventSourceRef.current.close();
+          eventSourceRef.current = null;
+        }
+      } else if (
+        statusData?.status === "FAILED" ||
+        statusData?.status === "EXPIRED" ||
+        statusData?.status === "CANCELLED"
+      ) {
+        setErrorMessage(statusData.failure_reason || "Không thể hoàn tất đơn Flash Sale");
+        setState("FAILED");
+        if (eventSourceRef.current) {
+          eventSourceRef.current.close();
+          eventSourceRef.current = null;
+        }
+      }
+    };
+
+    // 2. Polling Fallback song song (phòng trường hợp trình duyệt chặn SSE hoặc mất mạng)
+    const checkStatusPolling = async () => {
       try {
         attempts++;
         setPollCount(attempts);
-        const res = await orderService.getFlashSaleStatus(orderToken);
+        const res = await flashSaleService.getOrderStatus(reservationId);
         const statusData = res.data;
 
-        if (statusData?.status === "SUCCESS") {
-          setCreatedOrderCode(statusData.order_code || "");
-          setState("SUCCESS");
-          return;
-        }
-
-        if (statusData?.status === "FAILED") {
-          setErrorMessage(statusData.reason || "Không thể tạo đơn hàng Flash Sale");
-          setState("FAILED");
-          return;
+        if (statusData) {
+          handleStatusUpdate(statusData);
+          if (statusData.status === "CONFIRMED" || statusData.status === "FAILED" || statusData.status === "EXPIRED") {
+            return;
+          }
         }
 
         if (attempts >= maxAttempts) {
@@ -114,11 +199,10 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
           return;
         }
 
-        // Retry polling in 1s
-        timer = setTimeout(checkStatus, 1000);
+        timer = setTimeout(checkStatusPolling, 1200);
       } catch (err: any) {
         if (attempts < maxAttempts) {
-          timer = setTimeout(checkStatus, 1000);
+          timer = setTimeout(checkStatusPolling, 1500);
         } else {
           setErrorMessage(err?.message || "Lỗi kiểm tra trạng thái đơn hàng");
           setState("FAILED");
@@ -126,22 +210,18 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
       }
     };
 
-    // First check after 500ms
-    timer = setTimeout(checkStatus, 500);
+    timer = setTimeout(checkStatusPolling, 1000);
 
     return () => {
       if (timer) clearTimeout(timer);
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
     };
-  }, [state, orderToken]);
+  }, [state, reservationId]);
 
-  if (!isOpen || !product) return null;
-
-  const discountPercent =
-    product.discount_price && product.discount_price < product.price
-      ? Math.round(((product.price - product.discount_price) / product.price) * 100)
-      : 30;
-
-  const currentPrice = product.discount_price || product.price;
+  if (!isOpen || (!item && !product)) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -165,31 +245,47 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
 
     try {
       setLoading(true);
-      setErrorMessage("");
+      const activeCampId = campaignId || item?.campaign_id;
+      const activeProdId = item?.product_id || product?.id;
 
-      const customerName =
-        testMode === "FAIL"
-          ? `${formData.customer_name} [TEST_FAIL]`
-          : formData.customer_name;
+      if (!activeCampId || !activeProdId) {
+        setErrorMessage(
+          "Hiện tại chưa có chiến dịch Flash Sale nào đang mở bán cho sản phẩm này. Vui lòng quay lại trang chủ hoặc vào trang Quản trị Admin để kích hoạt chiến dịch!"
+        );
+        setState("FAILED");
+        return;
+      }
 
-      const res = await orderService.createFlashSaleOrder({
-        product_id: product.id,
-        quantity: 1, // Flash Sale: Giới hạn 1 món
-        customer_name: customerName,
-        customer_email: formData.customer_email,
-        customer_phone: formData.customer_phone,
-        shipping_address: formData.shipping_address,
-        payment_method: formData.payment_method,
-      });
+      // Sinh Idempotency-Key UUID v4
+      const idempotencyKey =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `fs-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-      if (res.data?.order_token) {
-        setOrderToken(res.data.order_token);
+      const res = await flashSaleService.reserveOrder(
+        activeCampId,
+        activeProdId,
+        {
+          quantity: quantity,
+          customer_name: formData.customer_name,
+          customer_email: formData.customer_email,
+          customer_phone: formData.customer_phone,
+          shipping_address: formData.shipping_address,
+          payment_method: formData.payment_method,
+        },
+        idempotencyKey
+      );
+
+      if (res.data?.reservation_id) {
+        setReservationId(res.data.reservation_id);
         setState("QUEUED");
       } else {
         throw new Error(res.message || "Không thể tiếp nhận đơn Flash Sale");
       }
     } catch (err: any) {
-      setErrorMessage(err?.message || "Sản phẩm Flash Sale đã hết hoặc bạn đã mua đợt này");
+      setErrorMessage(
+        err?.message || "Sản phẩm Flash Sale đã hết hàng hoặc bạn đã đạt giới hạn mua"
+      );
       setState("FAILED");
     } finally {
       setLoading(false);
@@ -197,9 +293,9 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
       <div className="relative w-full max-w-lg bg-slate-900 border border-amber-500/30 rounded-3xl shadow-2xl overflow-hidden text-slate-100 flex flex-col max-h-[90vh]">
-        {/* Header Header */}
+        {/* Header Bar */}
         <div className="relative bg-gradient-to-r from-amber-600 via-red-600 to-rose-700 p-5 text-white flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="p-2 bg-white/20 rounded-xl backdrop-blur-sm animate-pulse">
@@ -210,6 +306,15 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
                 <span className="text-xs font-black uppercase tracking-wider bg-black/30 px-2 py-0.5 rounded-full text-yellow-300 border border-yellow-300/30">
                   ⚡ GIỜ VÀNG GIÁ SỐC
                 </span>
+                {displayInfo.isOneTimeDeal ? (
+                  <span className="text-[10px] font-bold bg-amber-400 text-slate-900 px-1.5 py-0.5 rounded">
+                    1 LẦN / KHÁCH
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-bold bg-emerald-400 text-slate-900 px-1.5 py-0.5 rounded">
+                    MUA NHIỀU LẦN (MAX {maxAllowedQty})
+                  </span>
+                )}
               </div>
               <h3 className="text-lg font-black tracking-tight mt-0.5">
                 Săn Nhanh - Số Lượng Giới Hạn
@@ -228,8 +333,8 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
         <div className="bg-slate-800/80 px-5 py-3 border-b border-slate-700/60 flex items-center gap-4">
           <div className="relative w-14 h-14 rounded-xl overflow-hidden bg-slate-700 shrink-0 border border-slate-600">
             <Image
-              src={product.thumbnail || "/placeholder.png"}
-              alt={product.name}
+              src={displayInfo.thumbnail}
+              alt={displayInfo.name}
               fill
               sizes="56px"
               className="object-cover"
@@ -237,22 +342,22 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
           </div>
           <div className="flex-1 min-w-0">
             <h4 className="text-sm font-bold text-white truncate">
-              {product.name}
+              {displayInfo.name}
             </h4>
-            <div className="flex items-baseline gap-2 mt-0.5">
+            <div className="flex items-baseline gap-2 mt-0.5 flex-wrap">
               <span className="text-base font-black text-rose-400">
-                {formatPrice(currentPrice)}
+                {formatPrice(displayInfo.currentPrice)}
               </span>
-              {product.discount_price && product.discount_price < product.price && (
+              {displayInfo.originalPrice > displayInfo.currentPrice && (
                 <span className="text-xs text-slate-400 line-through">
-                  {formatPrice(product.price)}
+                  {formatPrice(displayInfo.originalPrice)}
                 </span>
               )}
               <span className="text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 px-1.5 py-0.5 rounded-md">
-                -{discountPercent}%
+                -{displayInfo.discountPercent}%
               </span>
               <span className="text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded-md ml-auto">
-                Kho: {product.stock} chiếc
+                Còn: {displayInfo.stockLeft} suất
               </span>
             </div>
           </div>
@@ -262,9 +367,41 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
         <div className="p-6 overflow-y-auto space-y-4">
           {state === "FORM" && (
             <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-xs text-amber-300 flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 shrink-0 text-amber-400" />
-                <span>Mỗi khách hàng chỉ được săn <strong>1 sản phẩm</strong> trong khung giờ này.</span>
+              {/* Quota Banner */}
+              <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-xs text-amber-300 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 shrink-0 text-amber-400" />
+                  <span>
+                    {displayInfo.isOneTimeDeal
+                      ? "Deal sốc: Mỗi khách hàng chỉ được săn đúng 1 sản phẩm trong đợt này."
+                      : `Khung giờ vàng: Bạn được mua tối đa ${maxAllowedQty} món trong chiến dịch này.`}
+                  </span>
+                </div>
+
+                {/* Quantity Controls (if allowed > 1) */}
+                {!displayInfo.isOneTimeDeal && maxAllowedQty > 1 && (
+                  <div className="flex items-center gap-2 bg-slate-800 px-2 py-1 rounded-lg border border-slate-700">
+                    <button
+                      type="button"
+                      disabled={quantity <= 1}
+                      onClick={() => setQuantity((q) => Math.max(1, q - 1))}
+                      className="p-1 text-slate-300 hover:text-white disabled:opacity-30"
+                    >
+                      <Minus className="w-3 h-3" />
+                    </button>
+                    <span className="font-mono font-bold text-xs text-amber-300 w-4 text-center">
+                      {quantity}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={quantity >= maxAllowedQty || quantity >= displayInfo.stockLeft}
+                      onClick={() => setQuantity((q) => Math.min(maxAllowedQty, q + 1))}
+                      className="p-1 text-slate-300 hover:text-white disabled:opacity-30"
+                    >
+                      <Plus className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-3">
@@ -343,17 +480,17 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
                       { id: "VNPAY", label: "VNPAY QR", icon: CreditCard },
                       { id: "MOMO", label: "Ví MoMo", icon: Zap },
                       { id: "BANK_TRANSFER", label: "Chuyển khoản", icon: PackageCheck },
-                    ].map((item) => {
-                      const Icon = item.icon;
-                      const selected = formData.payment_method === item.id;
+                    ].map((m) => {
+                      const Icon = m.icon;
+                      const selected = formData.payment_method === m.id;
                       return (
                         <button
-                          key={item.id}
+                          key={m.id}
                           type="button"
                           onClick={() =>
                             setFormData({
                               ...formData,
-                              payment_method: item.id as PaymentMethod,
+                              payment_method: m.id as PaymentMethod,
                             })
                           }
                           className={`flex items-center gap-2 p-2.5 rounded-xl border text-xs font-medium transition-all text-left ${
@@ -363,56 +500,12 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
                           }`}
                         >
                           <Icon className="w-4 h-4 text-rose-400 shrink-0" />
-                          <span>{item.label}</span>
+                          <span>{m.label}</span>
                         </button>
                       );
                     })}
                   </div>
                 </div>
-              </div>
-
-              {/* Developer Test Scenario Selector */}
-              <div className="p-3 rounded-2xl bg-slate-800/80 border border-slate-700/70 space-y-2.5 shadow-inner">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-slate-200 flex items-center gap-1.5">
-                    🧪 Kịch bản thử nghiệm:
-                  </span>
-                  <span className="text-[10px] bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full font-mono">
-                    Dev Mode
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setTestMode("SUCCESS")}
-                    className={`px-3 py-2 rounded-xl text-xs font-bold border transition-all flex items-center justify-center gap-1.5 ${
-                      testMode === "SUCCESS"
-                        ? "bg-emerald-500/20 border-emerald-500/80 text-emerald-300 shadow-md shadow-emerald-950"
-                        : "bg-slate-900/60 border-slate-700/60 text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                    🟢 Test Thành Công (OK)
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setTestMode("FAIL")}
-                    className={`px-3 py-2 rounded-xl text-xs font-bold border transition-all flex items-center justify-center gap-1.5 ${
-                      testMode === "FAIL"
-                        ? "bg-rose-500/20 border-rose-500/80 text-rose-300 shadow-md shadow-rose-950"
-                        : "bg-slate-900/60 border-slate-700/60 text-slate-400 hover:text-slate-200"
-                    }`}
-                  >
-                    <span className="w-2 h-2 rounded-full bg-rose-400 animate-ping" />
-                    🔴 Test Thất Bại & Rollback
-                  </button>
-                </div>
-                <p className="text-[11px] text-slate-400 leading-relaxed">
-                  {testMode === "SUCCESS"
-                    ? "✅ Trừ kho Redis ➔ Xếp hàng RabbitMQ ➔ Ghi DB PostgreSQL thành công ➔ Nhận mã đơn."
-                    : "⚠️ Trừ kho Redis ➔ Vào RabbitMQ ➔ Worker mô phỏng lỗi DB ➔ Rollback hoàn trả kho & mở khóa User."}
-                </p>
               </div>
 
               <div className="pt-2">
@@ -425,12 +518,12 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
                   {loading ? (
                     <>
                       <Loader2 className="w-5 h-5 animate-spin" />
-                      Đang xử lý khóa kho...
+                      Đang khóa tồn kho trên RAM...
                     </>
                   ) : (
                     <>
                       <Zap className="w-5 h-5 fill-current" />
-                      XÁC NHẬN SĂN HÀNG NGAY
+                      XÁC NHẬN SĂN DEAL ({formatPrice(displayInfo.currentPrice * quantity)})
                     </>
                   )}
                 </Button>
@@ -438,7 +531,7 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
             </form>
           )}
 
-          {/* QUEUED STATE: Live Polling */}
+          {/* QUEUED STATE: Live SSE Stream & Polling */}
           {state === "QUEUED" && (
             <div className="py-8 text-center space-y-6">
               <div className="relative w-20 h-20 mx-auto">
@@ -450,21 +543,30 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
 
               <div className="space-y-2">
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 text-xs font-bold border border-amber-500/30">
-                  <Clock className="w-3.5 h-3.5" />
-                  Đang xếp hàng tạo đơn trong RabbitMQ ({pollCount}s)
+                  {streamActive ? (
+                    <>
+                      <Radio className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                      <span>Đang kết nối Realtime SSE Stream</span>
+                    </>
+                  ) : (
+                    <>
+                      <Clock className="w-3.5 h-3.5" />
+                      <span>Đang xếp hàng qua Kafka ({pollCount}s)</span>
+                    </>
+                  )}
                 </div>
                 <h3 className="text-xl font-black text-white">
-                  Đã khóa tồn kho thành công!
+                  Đã giữ chỗ thành công trên RAM Redis!
                 </h3>
                 <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                  Hệ thống đang điều phối đơn hàng ghi vào cơ sở dữ liệu an toàn. Vui lòng không đóng cửa sổ...
+                  Mã giữ chỗ: <span className="font-mono text-amber-400 font-bold">{reservationId}</span>. Hệ thống đang tiến hành ghi nhận vào cơ sở dữ liệu và xác nhận giao dịch...
                 </p>
               </div>
 
               <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden border border-slate-700">
                 <div
                   className="bg-gradient-to-r from-amber-500 via-red-500 to-rose-500 h-full transition-all duration-300"
-                  style={{ width: `${Math.min(100, pollCount * 10 + 20)}%` }}
+                  style={{ width: `${Math.min(100, pollCount * 12 + 25)}%` }}
                 />
               </div>
             </div>
@@ -483,10 +585,10 @@ export const FlashSaleModal: React.FC<FlashSaleModalProps> = ({
                   SĂN DEAL THÀNH CÔNG!
                 </div>
                 <h3 className="text-2xl font-black text-white">
-                  Đơn hàng của bạn đã hoàn tất
+                  Đơn hàng đã được xác nhận
                 </h3>
                 <div className="inline-block bg-slate-800 px-4 py-2 rounded-xl border border-slate-700 text-sm font-mono text-emerald-400">
-                  Mã đơn: <strong>{createdOrderCode || "ORD-FS-SUCCESS"}</strong>
+                  Mã đơn: <strong>{createdOrderCode || reservationId}</strong>
                 </div>
                 <p className="text-xs text-slate-400">
                   Hóa đơn xác nhận và thông tin vận chuyển đã được gửi qua email <strong>{formData.customer_email}</strong>.

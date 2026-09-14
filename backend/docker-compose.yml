@@ -24,16 +24,6 @@ services:
     volumes:
       - redis_data:/data
 
-  # Giao diện quản lý Redis (RedisInsight)
-  # redisinsight:
-  #   image: redis/redisinsight:latest
-  #   container_name: ecom-redisinsight
-  #   restart: "no"
-  #   ports:
-  #     - "5540:5540"
-  #   volumes:
-  #     - redisinsight_data:/data
-
   # 3. Apache Kafka - Event Streaming (KRaft mode siêu nhẹ, không cần Zookeeper)
   kafka:
     image: apache/kafka:3.7.0
