@@ -310,6 +310,10 @@ func (m *mockProductClient) ReleaseFlashSaleStock(ctx context.Context, campaignI
 	return nil
 }
 
+func (m *mockProductClient) GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error) {
+	return &dto.StockAllocationResponse{}, nil
+}
+
 func TestOrderService_MultiItemRollback_WhenOneItemFails(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {

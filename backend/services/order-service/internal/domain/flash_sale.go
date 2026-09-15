@@ -130,13 +130,14 @@ type FlashSaleRepository interface {
 	UpdateReservationStatusCAS(id string, fromStatus ReservationStatus, toStatus ReservationStatus, orderID *uint) error
 	ClaimExpiredReservations(batchSize int) ([]*FlashSaleReservation, error)
 	ConfirmReservationDB(tx *gorm.DB, reservationID string, orderID uint) error
+	ConfirmReservationAndCreateOrder(tx *gorm.DB, inputEventID string, order *Order, reservationID string, outboxEvents []*OutboxEvent) error
 	ReleaseReservationDB(tx *gorm.DB, reservationID string, newStatus ReservationStatus) error
 }
 
 type OutboxRepository interface {
 	ClaimPendingBatch(batchSize int, workerID string, leaseDuration time.Duration) ([]*OutboxEvent, error)
-	MarkPublished(id string) error
-	MarkFailed(id string, retryIn time.Duration) error
+	MarkPublished(id string, workerID string) error
+	MarkFailed(id string, workerID string, retryIn time.Duration) error
 	ReclaimStaleProcessing(now time.Time) error
 }
 

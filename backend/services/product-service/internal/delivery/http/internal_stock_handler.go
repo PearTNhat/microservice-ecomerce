@@ -26,6 +26,7 @@ func SetupInternalStockRoutes(rh *server.RestHandler, repo domain.StockAllocatio
 
 	internalGroup := rh.App.Group("/internal/stock-allocations")
 	internalGroup.Post("/", handler.AllocateStock)
+	internalGroup.Get("/:campaignId/:productId", handler.GetAllocation)
 	internalGroup.Post("/:campaignId/:productId/release", handler.ReleaseStock)
 }
 
@@ -81,4 +82,25 @@ func (h *InternalStockHandler) ReleaseStock(c *fiber.Ctx) error {
 	return response.Success(c, http.StatusOK, "Hoàn trả tồn kho thành công", fiber.Map{
 		"released_quantity": released,
 	})
+}
+
+func (h *InternalStockHandler) GetAllocation(c *fiber.Ctx) error {
+	campaignIDStr := c.Params("campaignId")
+	productIDStr := c.Params("productId")
+
+	campaignID, err := strconv.ParseUint(campaignIDStr, 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "campaignId không hợp lệ", "INVALID_CAMPAIGN_ID")
+	}
+	productID, err := strconv.ParseUint(productIDStr, 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "productId không hợp lệ", "INVALID_PRODUCT_ID")
+	}
+
+	allocation, err := h.repo.FindByCampaignAndProduct(uint(campaignID), uint(productID))
+	if err != nil {
+		return response.NotFound(c, "Không tìm thấy thông tin phân bổ")
+	}
+
+	return response.Success(c, http.StatusOK, "Lấy thông tin phân bổ thành công", allocation)
 }

@@ -48,12 +48,13 @@ func main() {
 	// 4. Khởi tạo REST Server & DB (Dùng riêng database ecom_product_db)
 	srv := server.NewServer(appConfig)
 
-	// AutoMigrate bảng Category, Brand, Product, ProductStockAllocation
+	// AutoMigrate bảng Category, Brand, Product, ProductStockAllocation, ProcessedEvent
 	err := srv.DB.AutoMigrate(
 		&domain.Category{},
 		&domain.Brand{},
 		&domain.Product{},
 		&domain.ProductStockAllocation{},
+		&domain.ProcessedEvent{},
 	)
 	if err != nil {
 		logger.Error("❌ Lỗi AutoMigrate Product/Category/Brand", "error", err.Error())
@@ -72,6 +73,7 @@ func main() {
 	productRepo := repository.NewProductRepository(srv.DB)
 	productService := service.NewProductService(productRepo, importRedis, kafkaViewProducer, esClient)
 	stockAllocRepo := repository.NewStockAllocationRepository(srv.DB)
+	processedEventRepo := repository.NewProcessedEventRepository(srv.DB)
 
 	// 7. Khởi chạy các Kafka Consumer Workers
 	ctx, cancel := context.WithCancel(context.Background())
@@ -89,6 +91,13 @@ func main() {
 	if stockWorker != nil {
 		stockWorker.Start(ctx)
 		defer stockWorker.Close()
+	}
+
+	// 7.3. Kafka Flash Sale Confirmation Consumer (Cập nhật sold_quantity trên sổ cái phân bổ)
+	fsConfConsumer := worker.NewFlashSaleConfirmationConsumer(kafkaBrokers, srv.DB, stockAllocRepo, processedEventRepo, orderKafkaProducer)
+	if fsConfConsumer != nil {
+		fsConfConsumer.Start(ctx)
+		defer fsConfConsumer.Close()
 	}
 
 	// 8. Đăng ký Product REST Routes

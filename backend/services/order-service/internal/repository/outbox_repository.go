@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"errors"
 	"time"
 
 	"ecomerce-service/services/order-service/internal/domain"
@@ -59,31 +60,57 @@ func (r *outboxRepository) ClaimPendingBatch(batchSize int, workerID string, lea
 	return events, err
 }
 
-func (r *outboxRepository) MarkPublished(id string) error {
+func (r *outboxRepository) MarkPublished(id string, workerID string) error {
 	now := time.Now()
-	return r.db.Model(&domain.OutboxEvent{}).
+	query := r.db.Model(&domain.OutboxEvent{}).
 		Where("id = ?", id).
-		Updates(map[string]interface{}{
-			"status":       domain.OutboxStatusPublished,
-			"published_at": now,
-			"locked_by":    nil,
-			"locked_until": nil,
-		}).Error
+		Where("status = ?", domain.OutboxStatusProcessing)
+
+	if workerID != "" {
+		query = query.Where("locked_by = ?", workerID)
+	}
+
+	res := query.Updates(map[string]interface{}{
+		"status":       domain.OutboxStatusPublished,
+		"published_at": now,
+		"locked_by":    nil,
+		"locked_until": nil,
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("outbox event not found or lease expired/overwritten by another worker")
+	}
+	return nil
 }
 
-func (r *outboxRepository) MarkFailed(id string, retryIn time.Duration) error {
+func (r *outboxRepository) MarkFailed(id string, workerID string, retryIn time.Duration) error {
 	now := time.Now()
 	nextAttempt := now.Add(retryIn)
 
-	return r.db.Model(&domain.OutboxEvent{}).
+	query := r.db.Model(&domain.OutboxEvent{}).
 		Where("id = ?", id).
-		Updates(map[string]interface{}{
-			"status":          domain.OutboxStatusPending,
-			"attempts":        gorm.Expr("attempts + 1"),
-			"next_attempt_at": nextAttempt,
-			"locked_by":       nil,
-			"locked_until":    nil,
-		}).Error
+		Where("status = ?", domain.OutboxStatusProcessing)
+
+	if workerID != "" {
+		query = query.Where("locked_by = ?", workerID)
+	}
+
+	res := query.Updates(map[string]interface{}{
+		"status":          domain.OutboxStatusPending,
+		"attempts":        gorm.Expr("attempts + 1"),
+		"next_attempt_at": nextAttempt,
+		"locked_by":       nil,
+		"locked_until":    nil,
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("outbox event not found or lease expired/overwritten by another worker")
+	}
+	return nil
 }
 
 func (r *outboxRepository) ReclaimStaleProcessing(now time.Time) error {

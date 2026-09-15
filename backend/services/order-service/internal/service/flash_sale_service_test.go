@@ -45,6 +45,17 @@ func (m *mockProductClientForFlashSale) ReleaseFlashSaleStock(ctx context.Contex
 	return nil
 }
 
+func (m *mockProductClientForFlashSale) GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error) {
+	qty := m.allocated[productID]
+	return &dto.StockAllocationResponse{
+		CampaignID:        campaignID,
+		ProductID:         productID,
+		AllocatedQuantity: qty,
+		SoldQuantity:      0,
+		ReleasedQuantity:  0,
+	}, nil
+}
+
 func setupFlashSaleTestEnv(t *testing.T) (*gorm.DB, *miniredis.Miniredis, *redis.Client) {
 	dbName := fmt.Sprintf("file:fs_svc_mem_%d?mode=memory&cache=shared", time.Now().UnixNano())
 	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})

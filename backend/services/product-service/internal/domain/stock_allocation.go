@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 const (
 	StockAllocationStatusAllocated = "ALLOCATED"
@@ -25,5 +29,6 @@ type StockAllocationRepository interface {
 	AllocateStock(campaignID uint, productID uint, requestID string, quantity int) (*ProductStockAllocation, error)
 	ReleaseStock(campaignID uint, productID uint, requestID string) (int, error)
 	IncrementSoldQuantity(campaignID uint, productID uint, quantity int) error
+	IncrementSoldQuantityTx(tx *gorm.DB, campaignID uint, productID uint, quantity int) error
 	FindByCampaignAndProduct(campaignID uint, productID uint) (*ProductStockAllocation, error)
 }

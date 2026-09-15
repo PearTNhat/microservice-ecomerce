@@ -73,7 +73,11 @@ func (w *OrderEmailWorker) Start(ctx context.Context) {
 				if err := json.Unmarshal(m.Value, &event); err == nil && event.EventType == pkgKafka.EventOrderCreated {
 					var payload pkgKafka.OrderCreatedPayload
 					if err := json.Unmarshal(m.Value, &payload); err == nil {
-						_ = w.sendInvoiceEmail(payload)
+						if err := w.sendInvoiceEmail(payload); err != nil {
+							logger.Error("❌ OrderEmailWorker: Gửi email thất bại, sẽ retry", "order_id", payload.OrderID, "error", err.Error())
+							time.Sleep(1 * time.Second)
+							continue
+						}
 					} else if w.producer != nil {
 						_ = w.producer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, err.Error(), "")
 					}

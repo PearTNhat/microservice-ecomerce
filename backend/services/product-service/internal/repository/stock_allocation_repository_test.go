@@ -17,7 +17,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
 	assert.NoError(t, err)
 
-	err = db.AutoMigrate(&domain.Product{}, &domain.ProductStockAllocation{})
+	err = db.AutoMigrate(&domain.Product{}, &domain.ProductStockAllocation{}, &domain.ProcessedEvent{})
 	assert.NoError(t, err)
 
 	return db

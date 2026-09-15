@@ -100,6 +100,14 @@ func (w *ReconciliationWorker) reconcileActiveCampaigns(ctx context.Context) {
 				// Nếu có trong DB nhưng trạng thái đã là EXPIRED / CANCELLED mà Redis còn sót
 				if resv.Status == domain.ReservationStatusExpired || resv.Status == domain.ReservationStatusCancelled {
 					_, _ = redislock.ReleaseFlashSaleReservation(ctx, w.redisClient, camp.ID, item.ProductID, resvID, string(resv.Status))
+				} else if resv.Status == domain.ReservationStatusConfirmed {
+					// Nếu đã CONFIRMED trong DB mà vẫn còn sót trong Expiry ZSet của Redis:
+					// Chạy ConfirmFlashSaleReservation để chuyển counter atomic và ZREM.
+					confirmResp, cErr := redislock.ConfirmFlashSaleReservation(ctx, w.redisClient, camp.ID, item.ProductID, resvID)
+					if cErr == nil && (confirmResp.Code == "ALREADY_CONFIRMED" || confirmResp.Code == "INVALID_STATE") {
+						// Hash đã confirmed hoặc không còn tồn tại -> xóa member mồ côi khỏi ZSet
+						_ = w.redisClient.ZRem(ctx, expiryKey, resvID).Err()
+					}
 				}
 			}
 		}

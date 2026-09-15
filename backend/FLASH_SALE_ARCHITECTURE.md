@@ -40,16 +40,18 @@
 
 ## 2. Sơ đồ Kiến trúc Tổng thể (High-Level Architecture)
 
-Hệ thống được thiết kế theo mô hình **Hot-Path in-memory (RAM) & Async Background Processing**:
+Hệ thống được thiết kế theo mô hình **Hot-Path in-memory (RAM) & Async Background Processing** kết hợp **Dual Outbox Event Streaming & Cross-Service Settlement Barrier**:
 * **99% lượng tải** tranh mua (Peak Concurrency) được giải quyết và chặn đứng tức thì trong vài milli-giây tại tầng **Redis Cluster Lua Script**.
 * Cơ sở dữ liệu quan hệ **PostgreSQL chỉ nhận đúng số lượng request đã giành được suất giữ chỗ**.
+* **Dual Outbox Publishing**: Đảm bảo đồng bộ `sold_quantity` sang Product Service và cập nhật Redis Projection an toàn kể cả khi worker crash.
+* **Settlement Barrier & Fencing**: Ngăn chặn tuyệt đối hoàn kho sớm khi consumer Kafka còn đang xử lý dở dang.
 
 ```mermaid
 flowchart TD
     subgraph ClientLayer ["1. Tầng Client & Gateway"]
         Client(["Khách hàng (Mobile / Web FE)"])
         Gateway["API Gateway (:8000)"]
-        Client -->|"POST /flash-sales/:c/items/:p/orders<br/>[Header: Idempotency-Key]"| Gateway
+        Client -->|"POST /flash-sales/:c/items/:p/orders<br/>[Header: Idempotency-Key, Payment: COD]"| Gateway
     end
 
     subgraph FastPath ["2. Hot Path - Tranh mua tức thì (In-Memory RAM)"]
@@ -61,42 +63,62 @@ flowchart TD
 
     subgraph Persistence ["3. Tầng Bền vững & Giao dịch (PostgreSQL)"]
         OrderDB[("ecom_order_db<br/>(PostgreSQL)")]
-        OS -->|"Lưu Transaction:<br/>- flash_sale_reservations<br/>- outbox_events"| OrderDB
+        OS -->|"Lưu Transaction:<br/>- flash_sale_reservations<br/>- outbox_events (FLASH_SALE_ORDER_TASK)"| OrderDB
         OS -->|"Trả 202 Accepted<br/>reservation_id & stream_url"| Client
     end
 
-    subgraph AsyncPipeline ["4. Pipeline Bất đồng bộ (Kafka & Workers)"]
-        OutboxWorker["Outbox Publisher Worker<br/>(Lease Lock: SKIP LOCKED)"]
-        KafkaTopic{{"Kafka Topic:<br/>flashsale.orders"}}
-        FSWorker["Flash Sale Worker<br/>(Idempotent Consumer)"]
+    subgraph AsyncPipeline ["4. Pipeline Bất đồng bộ (Kafka & Dual Outbox)"]
+        OutboxWorker["Outbox Publisher Worker<br/>(Fencing Lease Lock: SKIP LOCKED)"]
+        KafkaTaskTopic{{"Kafka Topic:<br/>flashsale.orders"}}
+        FSWorker["Flash Sale Worker<br/>(ConfirmReservationAndCreateOrder)"]
+        KafkaConfirmTopic{{"Kafka Topic:<br/>flashsale.confirmed"}}
+        KafkaOrderTopic{{"Kafka Topic:<br/>order.events"}}
         
         OrderDB -.->|"Quét event PENDING"| OutboxWorker
-        OutboxWorker -->|"Publish Message"| KafkaTopic
-        KafkaTopic -->|"Consume Message"| FSWorker
-        FSWorker -->|"Tạo Order DB<br/>Ghi processed_events"| OrderDB
-        FSWorker -->|"Confirm Reservation"| Redis
-        FSWorker -->|"Publish Trạng thái"| RedisPubSub(("Redis Pub/Sub<br/>pubsub:order-status:resvID"))
+        OutboxWorker -->|"Publish Task"| KafkaTaskTopic
+        KafkaTaskTopic -->|"Consume Message"| FSWorker
+        FSWorker -->|"1 Transaction ACID:<br/>- Tạo orders & order_items<br/>- Update reservation CONFIRMED<br/>- Outbox: FLASH_SALE_ORDER_CONFIRMED<br/>- Outbox: ORDER_CREATED"| OrderDB
+        
+        FSWorker -.->|"Fast-path (500ms timeout)<br/>ConfirmReservation"| Redis
+        FSWorker -.->|"Publish Trạng thái"| RedisPubSub(("Redis Pub/Sub<br/>pubsub:order-status:resvID"))
+        
+        OutboxWorker -->|"Publish Confirmed"| KafkaConfirmTopic
+        OutboxWorker -->|"Publish Created"| KafkaOrderTopic
     end
 
-    subgraph RealtimeNotify ["5. Thông báo Khách hàng & Điều phối Kho"]
-        SSE["SSE Stream Endpoint<br/>GET /flash-sales/orders/:resvId/stream"]
+    subgraph ProductSettlement ["5. Cross-Service Settlement (Product Service)"]
+        PSConsumer["Flash Sale Confirmation Consumer<br/>(Product Service :8002)"]
+        ProdDB[("ecom_product_db<br/>(PostgreSQL)")]
         ProdWorker["ProductStockWorker<br/>(:8002)"]
         
-        RedisPubSub -->|"Đẩy kết quả CONFIRMED"| SSE
-        SSE -->|"Server-Sent Events"| Client
-        FSWorker -->|"Publish order.created<br/>(IsFlashSale = true)"| KafkaOrderTopic{{"Kafka Topic:<br/>order.events"}}
-        KafkaOrderTopic -->|"Bỏ qua trừ kho thường"| ProdWorker
+        KafkaConfirmTopic -->|"Consume"| PSConsumer
+        PSConsumer -->|"1 Transaction ACID:<br/>- processed_events (Idempotency)<br/>- product_stock_allocations (sold_quantity++)"| ProdDB
+        KafkaOrderTopic -->|"Bỏ qua trừ kho thường<br/>(IsFlashSale = true)"| ProdWorker
     end
 
-    subgraph AdminSaga ["6. Quản trị Chiến dịch & Saga Phân bổ Kho"]
+    subgraph SafetyProjection ["6. Projection Safety Net & Realtime Notify"]
+        ProjectionWorker["Flash Sale Projection Worker<br/>(Order Service)"]
+        SSE["SSE Stream Endpoint<br/>GET /flash-sales/orders/:resvId/stream"]
+        
+        KafkaConfirmTopic -->|"Consume Safety Net"| ProjectionWorker
+        ProjectionWorker -->|"Async Lua Confirm<br/>(Bảo đảm Redis đồng bộ)"| Redis
+        RedisPubSub -->|"Đẩy kết quả CONFIRMED"| SSE
+        SSE -->|"Server-Sent Events"| Client
+    end
+
+    subgraph AdminSaga ["7. Quản trị Chiến dịch & Saga Phân bổ Kho"]
         Admin(["Admin Dashboard"])
         PS["Product Service (:8002)"]
-        ProdDB[("ecom_product_db")]
         
         Admin -->|"POST /admin/flash-sales/:id/activate"| OS
         OS -->|"POST /internal/stock-allocations"| PS
         PS -->|"Trừ products.stock<br/>Tăng allocated_quantity"| ProdDB
         OS -->|"Prewarm Keys & Stock"| Redis
+
+        Admin -->|"POST /admin/flash-sales/:id/end"| OS
+        OS -->|"Settlement Barrier Check:<br/>GET /internal/stock-allocations/:c/:p<br/>(Chờ sold_quantity >= Order DB sold_stock)"| PS
+        OS -->|"Concurrency-Safe Release:<br/>POST /internal/stock-allocations/:c/:p/release<br/>(SELECT ... FOR UPDATE)"| PS
+        PS -->|"Hoàn tồn kho thừa về products.stock"| ProdDB
     end
 ```
 
@@ -120,85 +142,58 @@ flowchart TD
 
 ---
 
-### 3.2. Saga Phân bổ Tồn kho 2 Pha & Database-per-Service
+### 3.2. Saga Phân bổ Tồn kho 2 Pha, Chính sách COD & Database-per-Service
 Tuân thủ nguyên tắc cách ly dữ liệu: `order-service` sở hữu `ecom_order_db`, `product-service` sở hữu `ecom_product_db`. Không dùng chung kết nối DB, không dùng 2PC nặng nề.
 
 > **“2 pha” ở đây không phải Two-Phase Commit (2PC) của database.** Không có một transaction duy nhất khóa đồng thời cả hai DB. Đây là Saga do `Order Service` điều phối, gồm: (1) **chuẩn bị/cấp phát** kho cho toàn bộ sản phẩm và prewarm Redis ở trạng thái chưa bán; (2) **commit nghiệp vụ/công bố** campaign bằng cách chuyển DB rồi Redis sang `ACTIVE`. Khi một bước cấp phát Product Service thất bại, Saga chạy các API bồi hoàn idempotent để trả những phần kho đã cấp phát.
 
-#### Vì sao cần Database-per-Service?
+#### 1. Chính sách Thanh toán COD-Only (Loại trừ Rủi ro Xuất kho Sớm)
+* **Quy định nghiêm ngặt**: Tất cả các yêu cầu giữ chỗ đơn hàng Flash Sale (`POST /flash-sales/:campaignId/items/:productId/orders`) bắt buộc phải sử dụng phương thức thanh toán **COD (Cash On Delivery)**.
+* **Lý do thiết kế**:
+  - Trong sự kiện Flash Sale tốc độ cao, số lượng đã bán (`sold_quantity`) được ghi nhận ngay khi đơn hàng được xác nhận thành công.
+  - Nếu cho phép Online Payment (VNPAY, MoMo, Thẻ tín dụng...), khách hàng có thể hoàn tất giữ chỗ nhưng sau đó không thanh toán hoặc thanh toán thất bại. Việc này dẫn đến:
+    - Hoặc tăng sớm `sold_quantity` ở Product Service khi tiền chưa về (sai lệch sổ cái doanh số/tồn kho).
+    - Hoặc phải thiết kế luồng bồi hoàn cực kỳ phức tạp để giảm `sold_quantity` và hoàn kho Flash Sale sau khi cổng thanh toán báo timeout.
+  - Áp dụng chính sách COD giúp quy trình chốt đơn diễn ra tức thì, dứt khoát: Đơn được xác nhận $\rightarrow$ Order được tạo $\rightarrow$ `sold_quantity` tăng ngay lập tức và chuẩn xác 100%.
+
+#### 2. Vì sao cần Database-per-Service?
 
 `Order Service` chỉ quản lý campaign, item, reservation và order; nó không được tự chạy câu SQL trừ `products.stock`. Ngược lại, chỉ `Product Service` được sửa kho sản phẩm và sổ cái phân bổ. Vì vậy mỗi bước chỉ có thể ACID **bên trong DB của service sở hữu dữ liệu**:
 
 | Service | Dữ liệu sở hữu | Thay đổi nguyên tử cục bộ |
 |---|---|---|
-| Product Service | `products`, `product_stock_allocations` | Trừ kho thường và tạo allocation trong cùng transaction |
-| Order Service | `flash_sale_campaigns`, `flash_sale_items`, reservations, outbox | Đổi trạng thái campaign hoặc lưu reservation + outbox trong transaction của Order DB |
+| Product Service | `products`, `product_stock_allocations`, `processed_events` | Trừ kho thường và tạo allocation; cập nhật `sold_quantity` kèm idempotency trong cùng transaction |
+| Order Service | `flash_sale_campaigns`, `flash_sale_items`, reservations, outbox, orders | Đổi trạng thái campaign; lưu reservation + outbox; tạo đơn + xác nhận reservation + outbox trong transaction của Order DB |
 
-Tính nhất quán xuyên hai service đạt được bằng `request_id` để retry an toàn, state machine của campaign và **compensating transaction** (giao dịch bồi hoàn), thay vì rollback SQL xuyên hai DB.
+Tính nhất quán xuyên hai service đạt được bằng `request_id` để retry an toàn, state machine của campaign, **Settlement Barrier** khi kết thúc, và **compensating transaction** (giao dịch bồi hoàn), thay vì rollback SQL xuyên hai DB.
 
 * **Sổ cái phân bổ (`product_stock_allocations`)**:
   - Nằm trong `ecom_product_db`.
   - Quản lý 3 trạng thái: `allocated_quantity` (đã cấp phát cho Flash Sale), `sold_quantity` (đã xuất đơn), `released_quantity` (hoàn trả về kho thường).
-* **Quy trình Kích hoạt (Activation Saga)**:
+* **Quy trình Kích hoạt Resumable (Activation Saga)**:
   1. Admin gọi kích hoạt $\rightarrow$ `Order Service` chuyển trạng thái chiến dịch sang `ALLOCATING`.
-  2. `Order Service` gọi API nội bộ `POST /internal/stock-allocations` sang `Product Service` để khóa kho thường chuyển sang kho Flash Sale.
+  2. `Order Service` gọi API nội bộ `POST /internal/stock-allocations` sang `Product Service` để khóa kho thường chuyển sang kho Flash Sale (sử dụng `request_id = alloc-camp-{id}-prod-{pid}`).
   3. Nếu thành công: Nạp tồn kho và cấu hình lên RAM Redis $\rightarrow$ Lưu DB `ACTIVE` $\rightarrow$ Mở Redis `ACTIVE`.
   4. **Compensating Rollback (Bồi hoàn tự động)**: Nếu bất kỳ sản phẩm nào không đủ kho hoặc mạng lỗi, `Order Service` tự động gọi `POST /internal/stock-allocations/:campaignId/:productId/release` hoàn trả kho của những sản phẩm đã phân bổ trước đó, đưa trạng thái về `ACTIVATION_FAILED`.
+  5. **Tính năng Resumable**: Nếu hệ thống khởi động lại giữa chừng khi campaign đang ở `ALLOCATING`, Admin có thể gọi lại `activate` an toàn nhờ cơ chế Idempotency trên Product Service.
 
-#### Ví dụ thành công: campaign có hai sản phẩm
+#### 3. Settlement Barrier & Concurrency-Safe Release khi Kết thúc Chiến dịch (`EndCampaign`)
 
-Giả sử campaign `C10` cần 30 sản phẩm `P1` và 20 sản phẩm `P2`; kho thường ban đầu lần lượt là 100 và 50.
-
-```text
-Order DB                         Product DB                         Redis
-C10: DRAFT
-   |
-   +-- C10: ALLOCATING
-   |
-   +-- allocate(C10,P1,30) ----> P1.stock: 100 -> 70
-   |                             ledger(C10,P1): allocated=30,
-   |                                               sold=0, released=0
-   |
-   +-- allocate(C10,P2,20) ----> P2.stock: 50 -> 30
-   |                             ledger(C10,P2): allocated=20,
-   |                                               sold=0, released=0
-   |
-   +-- C10: PREWARMING ------------------------------------------> P1=30, P2=20,
-   |                                                               state=PAUSED
-   +-- C10: ACTIVE
-   +-- open Redis ------------------------------------------------> state=ACTIVE
-```
-
-Redis chỉ là bộ máy giữ chỗ tốc độ cao. Nguồn sự thật lâu dài cho việc “bao nhiêu kho đã tách khỏi kho thường” vẫn là allocation ledger trong Product DB. Trạng thái `PAUSED` khi prewarm ngăn khách mua trong khoảng Redis đã có dữ liệu nhưng Order DB chưa commit `ACTIVE`.
-
-#### Ví dụ thất bại và bồi hoàn
-
-Vẫn campaign `C10`: cấp 30 chiếc `P1` thành công, nhưng `P2` chỉ còn 10 nên yêu cầu 20 chiếc thất bại.
-
-```text
-1. C10: DRAFT -> ALLOCATING
-2. allocate P1 thành công: P1.stock 100 -> 70; ledger allocated=30
-3. allocate P2 thất bại: không đủ kho
-4. C10: ALLOCATING -> COMPENSATING
-5. release(C10,P1): to_release = allocated - sold - released
-                         = 30 - 0 - 0 = 30
-   P1.stock 70 -> 100; ledger released=30
-6. C10: COMPENSATING -> ACTIVATION_FAILED
-```
-
-Nếu response của bước 2 bị mất do timeout nhưng Product Service đã commit, retry vẫn dùng cùng khóa `alloc-camp-10-prod-1`; Product Service trả allocation cũ và **không trừ thêm 30**. Tương tự, gọi release lặp lại lần hai cho ledger đã release hết sẽ có `to_release = 0`, nên không cộng kho hai lần. Đây là lý do mỗi bước Saga phải idempotent.
-
-State machine rút gọn:
-
-```text
-DRAFT -> ALLOCATING -> PREWARMING -> ACTIVE
-             |
-             +-> COMPENSATING -> ACTIVATION_FAILED
-```
-
-Một Saga không tạo ra tính nguyên tử tức thời như 2PC: trong thời gian ngắn có thể thấy P1 đã bị trừ kho còn campaign chưa `ACTIVE`. Trạng thái trung gian và quy trình retry/bồi hoàn khiến trạng thái đó có thể quan sát được nhưng không trở thành sai lệch vĩnh viễn.
-
-> **Lưu ý về implementation hiện tại:** nhánh bồi hoàn trong `ActivateCampaign` hiện được gọi khi API allocation thất bại. Lỗi prewarm Redis mới chỉ được log rồi tiếp tục, và thao tác mở `ACTIVE` từng Redis item là best-effort. Muốn đạt đầy đủ cam kết “mọi lỗi trước khi công bố đều được phục hồi”, cần bổ sung retry/reconciliation cho Redis và bồi hoàn khi không thể hoàn tất prewarm; nếu không, một item có thể cần worker sửa lại trạng thái Redis sau crash.
+Khi một chiến dịch Flash Sale kết thúc (do hết giờ hoặc Admin chủ động đóng sớm qua `POST /admin/flash-sales/:campaignId/end`):
+1. **Chuyển trạng thái sang `ENDING` & Khóa Redis**: Ngừng nhận đơn mới trên Redis ngay lập tức.
+2. **Settlement Barrier (Hàng rào chốt sổ)**:
+   - Trong kiến trúc Event-Driven, các đơn hàng vừa chốt có thể vẫn đang nằm trên topic Kafka `flashsale.confirmed` và Product Service đang tiêu thụ.
+   - Nếu `Order Service` gọi hoàn kho ngay lập tức, `product_stock_allocations.sold_quantity` ở Product DB có thể nhỏ hơn thực tế trong Order DB (`sold_stock`), dẫn đến việc tính toán hoàn trả nhầm cả những sản phẩm khách hàng đã mua!
+   - **Giải pháp Settlement Barrier**:
+     - `Order Service` gọi API `GET /internal/stock-allocations/:campaignId/:productId` sang `Product Service`.
+     - Kiểm tra điều kiện chốt: `ProductDB.sold_quantity >= OrderDB.sold_stock`.
+     - Nếu chưa thỏa mãn, hệ thống tạm dừng và retry (tối đa 10 lần với exponential backoff).
+3. **Release Tồn kho Concurrency-Safe (`ReleaseStock`)**:
+   - Khi barrier đã thông suốt, `Order Service` gọi `POST /internal/stock-allocations/:campaignId/:productId/release`.
+   - `Product Service` thực thi với khóa hàng `SELECT ... FOR UPDATE` trên bảng `product_stock_allocations`:
+     $$\text{to\_release} = \text{allocated\_quantity} - \text{sold\_quantity} - \text{released\_quantity}$$
+   - Cộng lại $\text{to\_release}$ vào `products.stock` và cập nhật `released_quantity`. Nếu $\text{to\_release} \le 0$ thì bỏ qua an toàn (Idempotent).
+4. **Cập nhật trạng thái `ENDED`**: Lưu trạng thái kết thúc vào Order DB và dọn dẹp Redis cache.
 
 * **Chống Trừ kho 2 lần**:
   - Khi đơn hàng Flash Sale được tạo xong, event `order.created` bắn ra Kafka mang cờ `IsFlashSale: true`.
@@ -206,93 +201,88 @@ Một Saga không tạo ra tính nguyên tử tức thời như 2PC: trong thờ
 
 ---
 
-### 3.3. Transactional Outbox Pattern với Lease Lock
-Giải quyết bài toán: *“Làm sao đảm bảo đơn hàng đã lưu vào DB thì chắc chắn Kafka sẽ nhận được sự kiện, ngay cả khi server bị crash đột ngột?”*
+### 3.3. Transactional Outbox Pattern với Lease Lock Fencing
 
-Vấn đề gốc là không thể commit nguyên tử một transaction PostgreSQL và một lần publish Kafka:
+Giải quyết bài toán: *“Làm sao đảm bảo đơn hàng đã lưu vào DB thì chắc chắn Kafka sẽ nhận được sự kiện, ngay cả khi server bị crash đột ngột hoặc mạng lag làm worker bị treo?”*
 
-```text
-Cách ngây thơ A: COMMIT DB -> crash -> chưa publish Kafka     (mất event)
-Cách ngây thơ B: publish Kafka -> crash/rollback DB           (event không có dữ liệu tương ứng)
-```
-
-Outbox biến việc cần làm với Kafka thành một bản ghi nằm trong **chính transaction nghiệp vụ**. Sau commit, worker có thể publish ngay hoặc vài giây sau, nhưng event không bị quên.
-
-1. **Giao dịch Kép Nguyên tử**: Lưu `flash_sale_reservations` và `outbox_events` trong cùng một Database Transaction tại PostgreSQL.
+1. **Giao dịch Kép Nguyên tử**: Lưu bản ghi nghiệp vụ và `outbox_events` trong cùng một Database Transaction tại PostgreSQL.
 2. **Lease Lock không giữ DB Connection**:
-   - `OutboxPublisherWorker` dùng `SELECT ... FOR UPDATE SKIP LOCKED` để lấy 50 event `PENDING`.
-   - Cập nhật `locked_by = worker_id`, `locked_until = NOW() + 30s` và **COMMIT NGAY LẬP TỨC**.
+   - `OutboxPublisherWorker` dùng `SELECT ... FOR UPDATE SKIP LOCKED` để lấy lô 50 event `PENDING`.
+   - Cập nhật `locked_by = worker_id`, `locked_until = NOW() + 30s`, `status = PROCESSING` và **COMMIT NGAY LẬP TỨC**.
    - Bắn Kafka ở ngoài transaction. Nhờ vậy connection pool của DB không bị nghẽn trong lúc chờ mạng Kafka.
-   - Bắn thành công $\rightarrow$ Cập nhật `PUBLISHED`.
-   - Gặp lỗi $\rightarrow$ Tăng `attempts`, tính Exponential Backoff cho `next_attempt_at`.
-
-#### Ví dụ từ lúc khách giữ hàng đến Kafka
-
-Khách giữ 2 sản phẩm, tạo reservation `FSR-123`. Trong **một transaction của Order DB**:
-
-```sql
-BEGIN;
-INSERT INTO flash_sale_reservations (...) VALUES ('FSR-123', ..., 'RESERVED');
-UPDATE flash_sale_items
-SET reserved_stock = reserved_stock + 2
-WHERE id = :item_id
-  AND reserved_stock + sold_stock + 2 <= allocated_stock;
-INSERT INTO outbox_events(id, event_type, aggregate_id, status, ...)
-VALUES ('EVT-456', 'FLASH_SALE_RESERVED', 'FSR-123', 'PENDING', ...);
-COMMIT;
-```
-
-- Nếu bất kỳ câu lệnh nào lỗi: cả reservation, counter và outbox đều rollback; Kafka không cần nhận gì.
-- Nếu `COMMIT` thành công rồi process chết: `EVT-456` vẫn nằm trong DB; worker mới sẽ lấy và publish sau.
-- Vì Kafka publish và `MarkPublished` vẫn là hai thao tác riêng, worker có thể publish thành công rồi chết trước khi đánh dấu. Khi lease hết hạn, event được publish lại. Do đó hệ thống có ngữ nghĩa **at-least-once**, và consumer phải idempotent bằng `event_id` như mục 3.4.
-
-#### Lease lock hoạt động thế nào khi có nhiều worker?
-
-Giả sử `W1` và `W2` cùng quét outbox:
-
-```text
-t=00  W1 khóa hàng EVT-456 bằng FOR UPDATE SKIP LOCKED
-      W2 bỏ qua EVT-456 và claim event khác, không phải chờ W1
-t=01  W1 ghi status=PROCESSING, locked_by=W1, locked_until=t+30s; COMMIT
-t=02  W1 publish Kafka ở ngoài DB transaction
-t=03  publish thành công -> status=PUBLISHED
-```
-
-`FOR UPDATE` chỉ được giữ trong transaction claim rất ngắn. Sau `COMMIT`, “quyền xử lý” không còn là row lock vật lý mà là **lease có thời hạn** biểu diễn bởi `locked_by/locked_until`; vì thế không giữ một DB connection trong lúc chờ Kafka.
-
-Nếu `W1` chết ở `t=02`, event tạm ở `PROCESSING`. Sau `locked_until`, lần quét tiếp theo coi nó là stale và claim lại. Nếu Kafka đang lỗi, worker trả event về `PENDING`, tăng `attempts` và đặt `next_attempt_at` (ví dụ 1s, 2s, 4s, 8s...) để tránh retry dồn dập.
-
-#### Outbox và Saga liên hệ với nhau ra sao?
-
-Hai pattern giải quyết hai biên lỗi khác nhau:
-
-| Pattern | Biên lỗi được xử lý | Cách phục hồi |
-|---|---|---|
-| Saga | Nhiều transaction/API giữa Order Service và Product Service | Retry bước idempotent hoặc gọi bước bồi hoàn |
-| Transactional Outbox | Transaction Order DB và publish Kafka | Lưu ý định publish trong DB rồi worker retry bằng lease |
-
-Ví dụ, Saga activation dùng API để tách kho; còn khi một reservation/order đã được commit, Outbox bảo đảm event tương ứng cuối cùng sẽ đến Kafka. Consumer phía Product Service dùng `event_id` để chống xử lý lặp, rồi cập nhật `sold_quantity`; ba cơ chế Saga + Outbox + Idempotent Consumer ghép lại thành luồng chịu được crash nhưng không cần shared database hay distributed transaction.
+3. **Lease Ownership Verification (Fencing Token Pattern)**:
+   - Khi publish Kafka thành công, worker gọi `MarkPublished(eventID, workerID)`.
+   - Câu lệnh SQL kiểm tra quyền sở hữu nghiêm ngặt:
+     ```sql
+     UPDATE outbox_events
+     SET status = 'PUBLISHED', published_at = NOW(), locked_by = NULL, locked_until = NULL
+     WHERE id = :id AND status = 'PROCESSING' AND locked_by = :worker_id;
+     ```
+   - Kiểm tra `RowsAffected == 1`. Nếu `RowsAffected == 0` (do worker bị GC pause quá 30 giây khiến lease hết hạn và worker khác đã claim lại), worker cũ sẽ phát hiện mất quyền và hủy bỏ, tránh hoàn toàn lỗi ghi đè trạng thái sai lệch.
+   - Khi gặp lỗi mạng Kafka: Worker gọi `MarkFailed(eventID, workerID, errMsg)` với cùng cơ chế lease check, tăng `attempts` và tính Exponential Backoff cho `next_attempt_at`.
 
 ---
 
-### 3.4. Idempotent Consumer (`processed_events`)
-* Đảm bảo cơ chế tiêu thụ Kafka chính xác một lần về mặt nghiệp vụ (*Effectively-Once Processing*).
-* Bảng `processed_events (consumer_name, event_id)` sử dụng cơ chế `INSERT ... ON CONFLICT DO NOTHING`.
-* Nếu Kafka gửi lại tin nhắn cũ (At-least-once delivery) $\rightarrow$ Worker phát hiện đã xử lý và commit offset bỏ qua, không tạo đơn trùng.
+### 3.4. Dual Outbox Publishing & Cross-Service Settlement (`flashsale.confirmed`)
+
+Nhằm đảm bảo tính nhất quán tuyệt đối giữa Order DB, Product DB và Redis:
+
+#### 1. Luồng xử lý nguyên tử trong FlashSaleWorker
+Khi worker tiêu thụ một message đặt hàng từ topic `flashsale.orders`:
+1. Mở một Database Transaction duy nhất trong `ecom_order_db`:
+   - Kiểm tra trạng thái reservation (phải là `RESERVED`).
+   - Cập nhật reservation sang `CONFIRMED`.
+   - Tạo bản ghi trong `orders` và `order_items`.
+   - Ghi đồng thời **2 Outbox Events**:
+     - `FLASH_SALE_ORDER_CONFIRMED` $\rightarrow$ Topic `flashsale.confirmed` (chứa `order_token`, `reservation_id`, `campaign_id`, `product_id`, `quantity`).
+     - `ORDER_CREATED` $\rightarrow$ Topic `order.events` (chứa `is_flash_sale = true`).
+   - Commit transaction.
+2. **Hybrid Fast-Path tới Redis & Pub/Sub**:
+   - Sau khi DB commit thành công, worker gọi hàm `ConfirmFlashSaleReservation` lên Redis với **strict timeout 500ms**.
+   - Bắn Pub/Sub channel `pubsub:order-status:<reservationID>` để SSE stream trả kết quả `CONFIRMED` ngay lập tức về cho client mà không phải chờ Kafka round-trip.
+   - Nếu Redis bị timeout hoặc mạng chập chờn: Worker **không rollback DB** (vì DB đã commit là chân lý), mà để Kafka consumer bên dưới xử lý bù.
+3. **Xử lý lỗi DB Transaction an toàn**:
+   - Nếu xảy ra lỗi DB tạm thời (deadlock, connection drop), worker trả về `error` để Kafka consumer nack/requeue và thử lại sau.
+   - **Tuyệt đối không gọi hủy đơn (`CancelReservationAtomic`)** khi gặp lỗi DB tạm thời, bảo vệ quyền lợi giữ chỗ của khách hàng.
+
+#### 2. FlashSaleConfirmationConsumer (Product Service)
+* Lắng nghe topic `flashsale.confirmed` với consumer group `product-flashsale-confirm-group`.
+* Sử dụng bảng `processed_events` làm chốt chặn Idempotency:
+  ```go
+  // Thực thi trong 1 DB Transaction của Product Service:
+  // 1. Chặn trùng lặp sự kiện
+  err := processedEventRepo.InsertIfNew(tx, "product_flashsale_confirm_consumer", eventID)
+  if errors.Is(err, domain.ErrDuplicateEvent) {
+      return nil // Đã xử lý rồi, an toàn commit offset
+  }
+  // 2. Tăng sold_quantity trên sổ cái phân bổ kho
+  err = stockAllocRepo.IncrementSoldQuantityTx(tx, campaignID, productID, quantity)
+  ```
+* Cơ chế này đảm bảo dù Kafka có gửi lại message nhiều lần (At-least-once), số lượng đã bán `sold_quantity` chỉ tăng chính xác một lần duy nhất.
+
+#### 3. FlashSaleProjectionWorker (Order Service - Safety Net)
+* Lắng nghe topic `flashsale.confirmed` với consumer group `order-flashsale-projection-group`.
+* Đóng vai trò tấm lưới an toàn bất đồng bộ (Asynchronous Safety Net):
+  - Kiểm tra trạng thái reservation trên Redis.
+  - Nếu fast-path trước đó bị timeout hoặc fail mạng, projection worker sẽ thực thi Lua script `ConfirmFlashSaleReservation` để chuyển trạng thái Redis sang `CONFIRMED`, dịch chuyển hạn mức và dọn dẹp ZSet.
 
 ---
 
 ### 3.5. Bộ đôi Workers Quét Hết hạn & Ghost Cleanup
+
 * **`ReservationExpiryWorker`**:
   - Quét các đơn giữ chỗ quá thời hạn thanh toán (ví dụ: quá 120 giây chưa hoàn tất đặt hàng).
   - Tự động gọi Lua script `ReleaseReservationAtomic` trên Redis để nhả kho và quota, đồng thời cập nhật DB về `EXPIRED`.
-* **`ReconciliationWorker` (Dọn dẹp giữ chỗ ma)**:
-  - Nếu xảy ra sự cố hiếm gặp: Redis vừa giữ chỗ xong thì server sập điện trước khi kịp mở DB Transaction.
-  - Worker quét Redis Expiry ZSet, phát hiện reservation ID quá hạn mà **không hề tồn tại trong PostgreSQL** $\rightarrow$ Tự động thu hồi và hoàn lại tồn kho trên Redis.
+* **`ReconciliationWorker` (Dọn dẹp giữ chỗ ma & Chống rò rỉ ZSet)**:
+  - Nếu xảy ra sự cố hiếm gặp: Redis vừa giữ chỗ xong thì server sập điện trước khi kịp mở DB Transaction $\rightarrow$ Worker quét Redis Expiry ZSet, phát hiện reservation ID quá hạn mà **không hề tồn tại trong PostgreSQL** $\rightarrow$ Tự động thu hồi và hoàn lại tồn kho trên Redis.
+  - **Khắc phục ZSet Leak cho Đơn CONFIRMED**: Khi quét thấy reservation trong DB đã ở trạng thái `CONFIRMED` nhưng vẫn còn sót lại trong Redis Expiry ZSet (do fast-path rớt mạng), worker tự động gọi `ConfirmFlashSaleReservation` để dọn dẹp triệt để reservation khỏi ZSet, ngăn chặn memory leak trên Redis Cluster.
+* **`OrderEmailWorker` Resilience**:
+  - Khi gửi email xác nhận đơn hàng qua SMTP gặp sự cố mạng, worker không nuốt lỗi mà trả về error để Kafka retry với exponential backoff, đảm bảo khách hàng luôn nhận được email thông báo đơn hàng.
 
 ---
 
 ### 3.6. Thông báo Realtime SSE Stream & Polling Fallback
+
 * Endpoint `/flash-sales/orders/:reservationId/stream`:
   - Trả về ngay Snapshot trạng thái hiện tại (giải quyết triệt để race condition: đơn được tạo quá nhanh trước khi client kịp mở kết nối SSE).
   - Lắng nghe Redis Pub/Sub kênh `pubsub:order-status:<reservationID>`.
@@ -311,20 +301,21 @@ Ví dụ, Saga activation dùng API để tách kho; còn khi một reservation/
 | `GET` | `/admin/flash-sales` | Admin | Danh sách đợt sale (phân trang, lọc theo trạng thái) |
 | `GET` | `/admin/flash-sales/:campaignId` | Admin | Chi tiết đợt sale & danh sách sản phẩm |
 | `POST` | `/admin/flash-sales/:campaignId/items` | Admin | Thêm sản phẩm, giá sale, kho phân bổ, quota `max_per_user` |
-| `POST` | `/admin/flash-sales/:campaignId/activate` | Admin | Kích hoạt Saga phân bổ kho & Prewarm Redis |
+| `POST` | `/admin/flash-sales/:campaignId/activate` | Admin | Kích hoạt Saga phân bổ kho & Prewarm Redis (Resumable) |
 | `POST` | `/admin/flash-sales/:campaignId/clone` | Admin | **Nhân bản đợt sale** sang campaign mới sạch sẽ |
-| `POST` | `/admin/flash-sales/:campaignId/end` | Admin | Kết thúc sale sớm & hoàn trả kho thừa về Product Service |
+| `POST` | `/admin/flash-sales/:campaignId/end` | Admin | Kết thúc sale có Settlement Barrier & hoàn kho an toàn |
 
 ### 4.2. Internal APIs (Giao tiếp Nội bộ Microservices)
 | Method | Endpoint | Gọi từ | Mô tả chức năng |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/internal/stock-allocations` | Order Service | Khóa tồn kho thường, ghi nhận sổ cái phân bổ |
-| `POST` | `/internal/stock-allocations/:c/:p/release` | Order Service | Hoàn trả tồn kho Flash Sale về lại kho thường |
+| `GET` | `/internal/stock-allocations/:c/:p` | Order Service | Truy vấn sổ cái phân bổ (dùng cho Settlement Barrier) |
+| `POST` | `/internal/stock-allocations/:c/:p/release` | Order Service | Hoàn trả tồn kho Flash Sale về lại kho thường (FOR UPDATE) |
 
 ### 4.3. Customer APIs (Khách hàng Đặt mua)
 | Method | Endpoint | Quyền hạn | Mô tả chức năng |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/flash-sales/:campaignId/items/:productId/orders` | Customer | Đặt mua Flash Sale (kèm `Idempotency-Key` header) |
+| `POST` | `/flash-sales/:campaignId/items/:productId/orders` | Customer | Đặt mua Flash Sale (kèm `Idempotency-Key` header, COD-only) |
 | `GET` | `/flash-sales/orders/:reservationId` | Customer | Kiểm tra trạng thái đơn hàng (đọc từ RAM Redis) |
 | `GET` | `/flash-sales/orders/:reservationId/stream` | Customer | Mở kết nối SSE nhận kết quả realtime |
 
@@ -332,16 +323,20 @@ Ví dụ, Saga activation dùng API để tách kho; còn khi một reservation/
 
 ## 5. Kết quả Kiểm thử Tự động (Test Results)
 
-Hệ thống đã được kiểm thử toàn diện từ Unit Test đến Concurrency Stress Test:
+Hệ thống đã được kiểm thử toàn diện từ Unit Test, Concurrency Test đến Domain & Repository Integration Test:
 
 1. **Redis Engine Test (`pkg/redislock`)**:
    - `TestFlashSaleEngine_BasicReserveConfirmRelease`: PASS
    - `TestFlashSaleEngine_MultiplePurchasesQuota`: PASS (Xác thực người dùng mua nhiều lần đạt hạn mức thì chặn)
    - `TestFlashSaleEngine_Concurrency_ZeroOversell`: PASS (**50 goroutines tranh mua đồng thời 10 suất $\rightarrow$ Đúng 10 người được mua, 40 người bị từ chối, Tồn kho âm = 0**)
-2. **Product Stock Allocation Test (`product-service`)**:
+2. **Product Stock Allocation & Idempotency Test (`product-service`)**:
    - `TestStockAllocation_AllocateAndRelease`: PASS
    - `TestStockAllocation_InsufficientStock`: PASS
-3. **Flash Sale Service & Saga Test (`order-service`)**:
+   - `TestProcessedEventRepository`: PASS (Kiểm tra chống trùng lặp `clause.OnConflict{DoNothing: true}` và bắt `ErrDuplicateEvent`)
+   - `TestConfirmationConsumer`: PASS (Kiểm tra tăng `sold_quantity` chính xác khi nhận `flashsale.confirmed`)
+3. **Flash Sale Service, Repository & Saga Test (`order-service`)**:
+   - `TestConfirmReservationAndCreateOrder`: PASS (Xác thực 1 Transaction tạo Order, OrderItems, đổi status CONFIRMED và sinh 2 outbox events)
+   - `TestOutboxRepository_LeaseOwnership`: PASS (Xác thực Fencing Token: chỉ worker đang giữ lease mới được cập nhật outbox)
    - `TestFlashSaleService_CreateAndActivateCampaign`: PASS
    - `TestFlashSaleService_ActivateCompensatingSaga`: PASS (Mô phỏng lỗi và xác thực rollback bồi hoàn thành công)
 4. **Kịch bản E2E Shell Script (`test_flash_sale.sh`)**:
@@ -352,22 +347,16 @@ Hệ thống đã được kiểm thử toàn diện từ Unit Test đến Concu
 
 ---
 
-## 6. Kế hoạch Tích hợp Frontend Tiếp theo (Frontend Integration Roadmap)
+## 6. Vận hành Thực tế & Sẵn sàng Sản xuất (Production Operational Readiness)
 
-Để đưa toàn bộ hệ thống này lên giao diện Web cho người dùng và Admin, chúng ta cần triển khai 4 bước sau:
+Hệ thống hiện tại đã giải quyết triệt để tất cả các lỗ hổng về tính nhất quán dữ liệu phân tán (Data Inconsistency), tranh chấp ghi (Race Conditions), và rò rỉ bộ nhớ:
 
-1. **Bổ sung API Public lấy Campaign đang hoạt động**:
-   - Thêm `GET /flash-sales/active` ở Backend (trả về Campaign đang `ACTIVE` kèm danh sách items, giá sale, countdown timer `ends_at`).
-2. **Nâng cấp `FlashSaleSection` (`frontend/src/features/flash-sale`)**:
-   - Thay thế việc cắt tạm 4 sản phẩm tĩnh (`products.slice(0, 4)`) bằng việc fetch dữ liệu từ `GET /flash-sales/active`.
-   - Hiển thị đồng hồ đếm ngược (Countdown Timer) chính xác theo thời gian kết thúc của chiến dịch.
-3. **Nâng cấp `FlashSaleModal` & `order-service.ts`**:
-   - Khi bấm nút "Mua ngay":
-     - Tạo mã `Idempotency-Key` (bằng thư viện `crypto.randomUUID()`).
-     - Gửi `POST /flash-sales/:campaignId/items/:productId/orders`.
-     - Nhận về `reservation_id` (trạng thái 202 Accepted).
-     - Mở kết nối `EventSource` tới `/flash-sales/orders/:reservationId/stream` để hiển thị spinner và cập nhật ngay lập tức sang màn hình Đặt hàng thành công khi nhận được event `CONFIRMED`.
-4. **Xây dựng Màn hình Admin Quản trị Chiến dịch (`/admin/flash-sales`)**:
-   - Giao diện danh sách các chiến dịch Flash Sale (Đang chạy, Đã lên lịch, Đã kết thúc).
-   - Form tạo chiến dịch mới: chọn thời gian, chọn sản phẩm, nhập số lượng phân bổ, chọn loại hạn mức (1 lần / nhiều lần).
-   - Nút hành động: "Kích hoạt (Activate)", "Nhân bản (Clone)", "Kết thúc (End)".
+1. **Khả năng Chịu lỗi Mạng & Crash**:
+   - Transactional Outbox với Lease Ownership ngăn chặn mất mát hoặc lặp lại event khi worker bị kill.
+   - `processed_events` ở tất cả các consumer đảm bảo tính chất Effectively-Once.
+2. **Bảo toàn Tồn kho Thực tế**:
+   - Sự kết hợp giữa Saga bồi hoàn khi kích hoạt, chính sách thanh toán COD-only, và Settlement Barrier trước khi Release Stock giúp tồn kho giữa `Product DB`, `Order DB` và `Redis Cluster` luôn khớp nhau 100%.
+3. **Giám sát & Vận hành (Monitoring Recommendations)**:
+   - Giám sát độ trễ (Lag) của consumer group `product-flashsale-confirm-group` trên topic `flashsale.confirmed`.
+   - Thiết lập cảnh báo cho các outbox events có số lần retry `attempts >= 5`.
+   - Định kỳ kiểm tra log của `ReconciliationWorker` để theo dõi các trường hợp client rớt mạng đột ngột.

@@ -102,3 +102,14 @@ type ActiveCampaignResponse struct {
 	RemainingSeconds int64                    `json:"remaining_seconds"`
 	Items            []*ActiveCampaignItemDTO `json:"items"`
 }
+
+type StockAllocationResponse struct {
+	ID                uint   `json:"id"`
+	CampaignID        uint   `json:"campaign_id"`
+	ProductID         uint   `json:"product_id"`
+	RequestID         string `json:"request_id"`
+	AllocatedQuantity int    `json:"allocated_quantity"`
+	SoldQuantity      int    `json:"sold_quantity"`
+	ReleasedQuantity  int    `json:"released_quantity"`
+	Status            string `json:"status"`
+}

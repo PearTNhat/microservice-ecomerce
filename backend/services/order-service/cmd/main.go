@@ -123,6 +123,13 @@ func main() {
 		defer orderSagaWorker.Close()
 	}
 
+	// 7.7. Flash Sale Projection Worker (Lắng nghe flashsale.confirmed để cập nhật durable Redis projection)
+	fsProjectionWorker := worker.NewFlashSaleProjectionWorker(kafkaBrokers, importRedis, fsRepo)
+	if fsProjectionWorker != nil {
+		fsProjectionWorker.Start(ctx)
+		defer fsProjectionWorker.Close()
+	}
+
 	// 8. Đăng ký REST Routes theo từng module
 	rh := &server.RestHandler{
 		App:    srv.App,

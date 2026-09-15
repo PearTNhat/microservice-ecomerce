@@ -8,6 +8,7 @@ import (
 	"ecomerce-service/services/product-service/internal/domain"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type stockAllocationRepository struct {
@@ -82,8 +83,21 @@ func (r *stockAllocationRepository) ReleaseStock(campaignID uint, productID uint
 	var releasedCount int
 
 	err := r.db.Transaction(func(tx *gorm.DB) error {
+		// 1. Kiểm tra Idempotency theo requestID thông qua bảng processed_events
+		if requestID != "" {
+			var existing domain.ProcessedEvent
+			if err := tx.Where("consumer_name = ? AND event_id = ?", "stock-release", requestID).First(&existing).Error; err == nil {
+				// Đã xử lý request release này trước đó
+				releasedCount = 0
+				return nil
+			}
+		}
+
+		// 2. Khóa dòng allocation với SELECT ... FOR UPDATE để chống race condition khi có 2 request đồng thời
 		var allocation domain.ProductStockAllocation
-		if err := tx.Where("campaign_id = ? AND product_id = ?", campaignID, productID).First(&allocation).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("campaign_id = ? AND product_id = ?", campaignID, productID).
+			First(&allocation).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errors.New("không tìm thấy bản ghi phân bổ tồn kho")
 			}
@@ -93,17 +107,25 @@ func (r *stockAllocationRepository) ReleaseStock(campaignID uint, productID uint
 		toRelease := allocation.AllocatedQuantity - allocation.SoldQuantity - allocation.ReleasedQuantity
 		if toRelease <= 0 {
 			releasedCount = 0
+			// Vẫn ghi nhận requestID để các lần gọi sau không phải lock lại vô ích
+			if requestID != "" {
+				_ = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&domain.ProcessedEvent{
+					ConsumerName: "stock-release",
+					EventID:      requestID,
+					ProcessedAt:  time.Now(),
+				})
+			}
 			return nil
 		}
 
-		// Hoàn lại tồn kho cho Product
+		// 3. Hoàn lại tồn kho cho Product
 		if err := tx.Model(&domain.Product{}).
 			Where("id = ?", productID).
 			UpdateColumn("stock", gorm.Expr("stock + ?", toRelease)).Error; err != nil {
 			return err
 		}
 
-		// Cập nhật allocation
+		// 4. Cập nhật allocation
 		newReleased := allocation.ReleasedQuantity + toRelease
 		status := allocation.Status
 		if newReleased+allocation.SoldQuantity >= allocation.AllocatedQuantity {
@@ -120,6 +142,17 @@ func (r *stockAllocationRepository) ReleaseStock(campaignID uint, productID uint
 			return err
 		}
 
+		// 5. Ghi nhận requestID vào sổ cái để chống duplicate
+		if requestID != "" {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&domain.ProcessedEvent{
+				ConsumerName: "stock-release",
+				EventID:      requestID,
+				ProcessedAt:  time.Now(),
+			}).Error; err != nil {
+				return err
+			}
+		}
+
 		releasedCount = toRelease
 		return nil
 	})
@@ -128,7 +161,15 @@ func (r *stockAllocationRepository) ReleaseStock(campaignID uint, productID uint
 }
 
 func (r *stockAllocationRepository) IncrementSoldQuantity(campaignID uint, productID uint, quantity int) error {
-	res := r.db.Model(&domain.ProductStockAllocation{}).
+	return r.IncrementSoldQuantityTx(r.db, campaignID, productID, quantity)
+}
+
+func (r *stockAllocationRepository) IncrementSoldQuantityTx(tx *gorm.DB, campaignID uint, productID uint, quantity int) error {
+	if tx == nil {
+		tx = r.db
+	}
+
+	res := tx.Model(&domain.ProductStockAllocation{}).
 		Where("campaign_id = ? AND product_id = ? AND sold_quantity + released_quantity + ? <= allocated_quantity", campaignID, productID, quantity).
 		Updates(map[string]interface{}{
 			"sold_quantity": gorm.Expr("sold_quantity + ?", quantity),
@@ -139,7 +180,7 @@ func (r *stockAllocationRepository) IncrementSoldQuantity(campaignID uint, produ
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return errors.New("không thể tăng số lượng đã bán: vượt quá số lượng phân bổ")
+		return errors.New("không thể tăng số lượng đã bán: vượt quá số lượng phân bổ hoặc không tìm thấy allocation")
 	}
 	return nil
 }

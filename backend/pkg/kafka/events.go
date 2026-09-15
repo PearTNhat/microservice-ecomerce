@@ -47,18 +47,38 @@ type StockResultPayload struct {
 
 // FlashSaleOrderTaskPayload tác vụ tạo đơn Flash Sale bất đồng bộ bắn vào "flashsale.orders"
 type FlashSaleOrderTaskPayload struct {
-	OrderToken      string    `json:"order_token"`
-	UserID          string    `json:"user_id"`
+	EventID         string    `json:"event_id,omitempty"`
+	OrderToken      string    `json:"order_token,omitempty"`
+	ReservationID   string    `json:"reservation_id,omitempty"`
+	RequestID       string    `json:"request_id,omitempty"`
+	CampaignID      uint      `json:"campaign_id,omitempty"`
 	ProductID       uint      `json:"product_id"`
+	UserID          string    `json:"user_id"`
 	Quantity        int       `json:"quantity"`
-	Price           float64   `json:"price"`
-	CustomerName    string    `json:"customer_name"`
-	CustomerEmail   string    `json:"customer_email"`
-	CustomerPhone   string    `json:"customer_phone"`
-	ShippingAddress string    `json:"shipping_address"`
-	PaymentMethod   string    `json:"payment_method"`
+	Price           float64   `json:"price,omitempty"`
+	UnitPrice       float64   `json:"unit_price,omitempty"`
+	TotalAmount     float64   `json:"total_amount,omitempty"`
+	PaymentMethod   string    `json:"payment_method,omitempty"`
+	CustomerName    string    `json:"customer_name,omitempty"`
+	CustomerEmail   string    `json:"customer_email,omitempty"`
+	CustomerPhone   string    `json:"customer_phone,omitempty"`
+	ShippingAddress string    `json:"shipping_address,omitempty"`
 	TraceID         string    `json:"trace_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
+}
+
+// FlashSaleOrderConfirmedPayload sự kiện đơn hàng Flash Sale đã được xác nhận
+type FlashSaleOrderConfirmedPayload struct {
+	EventID       string    `json:"event_id"`
+	EventType     string    `json:"event_type"` // FLASH_SALE_ORDER_CONFIRMED
+	OccurredAt    time.Time `json:"occurred_at"`
+	TraceID       string    `json:"trace_id"`
+	OrderID       uint      `json:"order_id"`
+	OrderCode     string    `json:"order_code"`
+	ReservationID string    `json:"reservation_id"`
+	CampaignID    uint      `json:"campaign_id"`
+	ProductID     uint      `json:"product_id"`
+	Quantity      int       `json:"quantity"`
 }
 
 // DeadLetterPayload thông tin sự kiện lỗi được chuyển vào Dead Letter Topic "orders.dead_letter"

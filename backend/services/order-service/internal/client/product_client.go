@@ -18,6 +18,7 @@ type ProductClient interface {
 	GetProduct(ctx context.Context, productID uint) (*dto.ProductDetailResponse, error)
 	AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error
 	ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error
+	GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error)
 }
 
 type productClient struct {
@@ -163,5 +164,41 @@ func (c *productClient) ReleaseFlashSaleStock(ctx context.Context, campaignID, p
 	}
 
 	return nil
+}
+
+func (c *productClient) GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error) {
+	reqURL := fmt.Sprintf("%s/internal/stock-allocations/%d/%d", c.baseURL, campaignID, productID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if traceID := logger.GetTraceID(ctx); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("không thể kết nối tới Product Service (%s): %w", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return nil, fmt.Errorf("lỗi lấy thông tin allocation từ Product Service (HTTP %d): %s", resp.StatusCode, errResp.Message)
+	}
+
+	var apiResp struct {
+		Success bool                         `json:"success"`
+		Data    *dto.StockAllocationResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("lỗi parse json allocation response: %w", err)
+	}
+
+	return apiResp.Data, nil
 }
 

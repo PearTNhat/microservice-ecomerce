@@ -84,10 +84,10 @@ func (w *OutboxPublisherWorker) processBatch(ctx context.Context) {
 			if retryIn > 5*time.Minute {
 				retryIn = 5 * time.Minute
 			}
-			_ = w.outboxRepo.MarkFailed(event.ID, retryIn)
+			_ = w.outboxRepo.MarkFailed(event.ID, w.workerID, retryIn)
 			continue
 		}
 
-		_ = w.outboxRepo.MarkPublished(event.ID)
+		_ = w.outboxRepo.MarkPublished(event.ID, w.workerID)
 	}
 }

@@ -133,20 +133,26 @@ func (s *flashSaleService) ActivateCampaign(ctx context.Context, campaignID uint
 		return fmt.Errorf("không tìm thấy campaign #%d", campaignID)
 	}
 
-	if camp.Status != domain.CampaignStatusDraft && camp.Status != domain.CampaignStatusActivationFailed {
-		return fmt.Errorf("chỉ có thể kích hoạt campaign ở trạng thái DRAFT hoặc ACTIVATION_FAILED (hiện tại: %s)", camp.Status)
+	// Hỗ trợ kích hoạt mới hoặc resume khi crash ở ALLOCATING / PREWARMING / ACTIVATION_FAILED
+	if camp.Status != domain.CampaignStatusDraft &&
+		camp.Status != domain.CampaignStatusActivationFailed &&
+		camp.Status != domain.CampaignStatusAllocating &&
+		camp.Status != domain.CampaignStatusPrewarming {
+		return fmt.Errorf("chỉ có thể kích hoạt campaign ở trạng thái DRAFT, ACTIVATION_FAILED, ALLOCATING hoặc PREWARMING (hiện tại: %s)", camp.Status)
 	}
 
 	if len(camp.Items) == 0 {
 		return errors.New("campaign không có sản phẩm nào để kích hoạt")
 	}
 
-	// 1. Chuyển trạng thái sang ALLOCATING
-	if err := s.repo.UpdateCampaignStatus(campaignID, camp.Status, domain.CampaignStatusAllocating); err != nil {
-		return err
+	// 1. Chuyển trạng thái sang ALLOCATING nếu chưa ở ALLOCATING / PREWARMING
+	if camp.Status != domain.CampaignStatusAllocating && camp.Status != domain.CampaignStatusPrewarming {
+		if err := s.repo.UpdateCampaignStatus(campaignID, camp.Status, domain.CampaignStatusAllocating); err != nil {
+			return err
+		}
 	}
 
-	// 2. Gọi Product Service phân bổ tồn kho
+	// 2. Gọi Product Service phân bổ tồn kho (Idempotent theo requestID)
 	var allocatedProductIDs []uint
 	var allocateErr error
 
@@ -175,11 +181,14 @@ func (s *flashSaleService) ActivateCampaign(ctx context.Context, campaignID uint
 	}
 
 	// 3. Chuyển sang PREWARMING
-	if err := s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusAllocating, domain.CampaignStatusPrewarming); err != nil {
-		return err
+	if camp.Status != domain.CampaignStatusPrewarming {
+		if err := s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusAllocating, domain.CampaignStatusPrewarming); err != nil {
+			logger.WarnContext(ctx, "Không thể chuyển ALLOCATING -> PREWARMING, có thể đã ở PREWARMING", "error", err.Error())
+		}
 	}
 
 	// 4. Prewarm toàn bộ Items lên Redis với trạng thái ban đầu là PAUSED
+	var prewarmErr error
 	for _, item := range camp.Items {
 		err := redislock.PrewarmCampaignItem(
 			ctx, s.redisClient,
@@ -193,8 +202,16 @@ func (s *flashSaleService) ActivateCampaign(ctx context.Context, campaignID uint
 			"PAUSED",
 		)
 		if err != nil {
+			prewarmErr = fmt.Errorf("lỗi prewarm Redis sản phẩm #%d: %w", item.ProductID, err)
 			logger.ErrorContext(ctx, "Lỗi prewarm Redis", "product_id", item.ProductID, "error", err.Error())
+			break
 		}
+	}
+
+	// Nếu prewarm Redis thất bại -> Không được active dở dang! Báo lỗi để retry
+	if prewarmErr != nil {
+		logger.ErrorContext(ctx, "❌ Prewarm Redis thất bại, không kích hoạt campaign", "campaign_id", campaignID, "error", prewarmErr.Error())
+		return prewarmErr
 	}
 
 	// 5. Cập nhật Campaign thành ACTIVE trong DB
@@ -219,22 +236,70 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 		return err
 	}
 
-	if camp.Status != domain.CampaignStatusActive {
-		return fmt.Errorf("chỉ có thể kết thúc campaign đang ACTIVE (hiện tại: %s)", camp.Status)
+	if camp.Status != domain.CampaignStatusActive && camp.Status != domain.CampaignStatusEnding {
+		return fmt.Errorf("chỉ có thể kết thúc campaign đang ACTIVE hoặc ENDING (hiện tại: %s)", camp.Status)
 	}
 
-	_ = s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusActive, domain.CampaignStatusEnding)
+	// 1. Chuyển sang ENDING nếu đang ACTIVE
+	if camp.Status == domain.CampaignStatusActive {
+		if err := s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusActive, domain.CampaignStatusEnding); err != nil {
+			return err
+		}
+	}
 
-	// Đóng cổng Redis và thu hồi tồn kho chưa bán về Product Service
+	// 2. Đóng cổng Redis ngay lập tức (state = ENDED) để chặn giữ chỗ mới
 	for _, item := range camp.Items {
 		if s.redisClient != nil {
 			_ = s.redisClient.Set(ctx, redislock.KeyState(campaignID, item.ProductID), "ENDED", 0)
 		}
-
-		reqID := fmt.Sprintf("end-release-%d-%d", campaignID, item.ProductID)
-		_ = s.productClient.ReleaseFlashSaleStock(ctx, campaignID, item.ProductID, reqID)
 	}
 
+	// 3. SETTLEMENT BARRIER (Hàng rào quyết toán tồn kho):
+	// Đối với từng item, kiểm tra Product DB sold_quantity đã bắt kịp Order DB sold_stock chưa.
+	// Nếu Product consumer còn đang lag phía sau, không được phép release vội vì sẽ tính to_release sai!
+	for _, item := range camp.Items {
+		settled := false
+		var lastProductSold int
+		for attempt := 0; attempt < 5; attempt++ {
+			alloc, err := s.productClient.GetStockAllocation(ctx, campaignID, item.ProductID)
+			if err == nil && alloc != nil {
+				lastProductSold = alloc.SoldQuantity
+				if alloc.SoldQuantity >= item.SoldStock {
+					settled = true
+					break
+				}
+			}
+			logger.WarnContext(ctx, "⏳ [SETTLEMENT BARRIER] Chờ Product DB tiêu thụ xong sự kiện bán hàng",
+				"campaign_id", campaignID,
+				"product_id", item.ProductID,
+				"order_db_sold", item.SoldStock,
+				"product_db_sold", lastProductSold,
+				"attempt", attempt+1,
+			)
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if !settled {
+			return fmt.Errorf("chưa thể kết thúc campaign: sổ cái Product DB (sold=%d) chưa quyết toán kịp với Order DB (sold=%d). Campaign được giữ ở trạng thái ENDING để retry",
+				lastProductSold, item.SoldStock)
+		}
+	}
+
+	// 4. Khi toàn bộ các sản phẩm đã quyết toán đồng bộ -> Gọi ReleaseFlashSaleStock
+	for _, item := range camp.Items {
+		reqID := fmt.Sprintf("end-release-%d-%d", campaignID, item.ProductID)
+		if err := s.productClient.ReleaseFlashSaleStock(ctx, campaignID, item.ProductID, reqID); err != nil {
+			logger.ErrorContext(ctx, "❌ Lỗi release tồn kho cho sản phẩm",
+				"campaign_id", campaignID,
+				"product_id", item.ProductID,
+				"error", err.Error(),
+			)
+			// Không nuốt lỗi! Giữ nguyên ENDING để lần sau retry
+			return fmt.Errorf("lỗi release tồn kho sản phẩm #%d: %w", item.ProductID, err)
+		}
+	}
+
+	// 5. Cập nhật sang ENDED sau khi toàn bộ items đã được hoàn kho thành công
 	return s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusEnding, domain.CampaignStatusEnded)
 }
 
@@ -391,8 +456,11 @@ func (s *flashSaleService) ReserveOrder(
 	}
 
 	paymentMethod := strings.ToUpper(req.PaymentMethod)
-	if paymentMethod != "COD" && paymentMethod != "MOMO" && paymentMethod != "VNPAY" && paymentMethod != "BANKING" {
+	if paymentMethod == "" {
 		paymentMethod = "COD"
+	}
+	if paymentMethod != "COD" {
+		return nil, errors.New("chiến dịch Flash Sale hiện chỉ hỗ trợ hình thức thanh toán khi nhận hàng (COD)")
 	}
 
 	// 1. Tính Fingerprint của request (SHA-256) để chống tái sử dụng Idempotency-Key với body khác
@@ -405,10 +473,6 @@ func (s *flashSaleService) ReserveOrder(
 	}
 
 	resvSeconds := item.ReservationSeconds
-	if paymentMethod != "COD" {
-		resvSeconds = 600 // Online payment có thời gian giữ chỗ 10 phút
-	}
-
 	reservationID := fmt.Sprintf("FSR-%s", strings.ToUpper(uuid.New().String()[:12]))
 
 	// 3. THÀNH TRÌ REDIS: Giữ chỗ tồn kho & Quota bằng Atomic Lua Script
@@ -470,7 +534,9 @@ func (s *flashSaleService) ReserveOrder(
 	}
 
 	// Chuẩn bị payload cho Outbox Event
+	outboxID := uuid.New().String()
 	outboxPayload := map[string]interface{}{
+		"event_id":         outboxID,
 		"reservation_id":   finalResvID,
 		"request_id":       requestID,
 		"campaign_id":      campaignID,
@@ -489,7 +555,7 @@ func (s *flashSaleService) ReserveOrder(
 	payloadBytes, _ := json.Marshal(outboxPayload)
 
 	outbox := &domain.OutboxEvent{
-		ID:            uuid.New().String(),
+		ID:            outboxID,
 		AggregateType: "FlashSaleReservation",
 		AggregateID:   finalResvID,
 		EventType:     "FLASH_SALE_RESERVED",

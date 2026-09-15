@@ -266,6 +266,54 @@ func (r *flashSaleRepository) ConfirmReservationDB(tx *gorm.DB, reservationID st
 	return nil
 }
 
+func (r *flashSaleRepository) ConfirmReservationAndCreateOrder(
+	tx *gorm.DB,
+	inputEventID string,
+	order *domain.Order,
+	reservationID string,
+	outboxEvents []*domain.OutboxEvent,
+) error {
+	db := r.db
+	if tx != nil {
+		db = tx
+	}
+
+	// 1. Kiểm tra và ghi nhận processed_events nếu có inputEventID
+	if inputEventID != "" {
+		processed := domain.ProcessedEvent{
+			ConsumerName: "flash-sale-worker",
+			EventID:      inputEventID,
+			ProcessedAt:  time.Now(),
+		}
+		res := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&processed)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errors.New("event đã được xử lý trước đó (duplicate)")
+		}
+	}
+
+	// 2. Tạo Order và OrderItems
+	if err := db.Create(order).Error; err != nil {
+		return err
+	}
+
+	// 3. Confirm reservation trong DB và chuyển reserved_stock -> sold_stock
+	if err := r.ConfirmReservationDB(db, reservationID, order.ID); err != nil {
+		return err
+	}
+
+	// 4. Lưu toàn bộ các Outbox Events
+	for _, outbox := range outboxEvents {
+		if err := db.Create(outbox).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (r *flashSaleRepository) ReleaseReservationDB(tx *gorm.DB, reservationID string, newStatus domain.ReservationStatus) error {
 	db := r.db
 	if tx != nil {
