@@ -1,11 +1,12 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { ActiveCampaign, ActiveCampaignItem } from "@/features/flash-sale/types";
+import { useCartStore } from "@/features/cart/store/useCartStore";
 import { flashSaleService } from "@/features/flash-sale/services/flash-sale-service";
+import { ActiveCampaign, ActiveCampaignItem } from "@/features/flash-sale/types";
 import { Product } from "@/features/products/types";
 import { formatPrice } from "@/lib/utils";
-import { Flame, Sparkles, Timer, Zap, ShieldCheck } from "lucide-react";
+import { Flame, ShoppingBag, Sparkles, Timer, Zap } from "lucide-react";
 import Image from "next/image";
 import React, { useEffect, useState } from "react";
 import { FlashSaleModal } from "./flash-sale-modal";
@@ -17,6 +18,7 @@ interface FlashSaleSectionProps {
 export const FlashSaleSection: React.FC<FlashSaleSectionProps> = ({
   products = [],
 }) => {
+  const { addItem } = useCartStore();
   const [activeCampaign, setActiveCampaign] = useState<ActiveCampaign | null>(null);
   const [selectedItem, setSelectedItem] = useState<ActiveCampaignItem | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -42,7 +44,7 @@ export const FlashSaleSection: React.FC<FlashSaleSectionProps> = ({
         } else if (mounted) {
           setActiveCampaign(null);
         }
-      } catch (err) {
+      } catch {
         // Fallback to static products if backend has no active campaign
       } finally {
         if (mounted) setLoading(false);
@@ -96,12 +98,6 @@ export const FlashSaleSection: React.FC<FlashSaleSectionProps> = ({
   const handleOpenBuyItem = (item: ActiveCampaignItem) => {
     setSelectedItem(item);
     setSelectedProduct(null);
-    setModalOpen(true);
-  };
-
-  const handleOpenBuyProductFallback = (p: Product) => {
-    setSelectedProduct(p);
-    setSelectedItem(null);
     setModalOpen(true);
   };
 
@@ -233,12 +229,42 @@ export const FlashSaleSection: React.FC<FlashSaleSectionProps> = ({
                     </div>
                   </div>
 
-                  {/* Action Button */}
-                  <div className="pt-3">
+                  {/* Action Buttons: Add to Cart (Mixed Cart) & Săn Ngay (Instant 1-click modal) */}
+                  <div className="pt-3 flex items-center gap-2">
+                    <Button
+                      disabled={item.remaining_stock <= 0}
+                      onClick={() => {
+                        addItem(
+                          {
+                            id: item.product_id,
+                            name: item.product_name,
+                            slug: `product-${item.product_id}`,
+                            price: item.original_price,
+                            discount_price: item.sale_price,
+                            stock: item.remaining_stock,
+                            thumbnail: item.product_thumbnail,
+                            rating: 5,
+                            views: 100,
+                          },
+                          1,
+                          {
+                            isFlashSale: true,
+                            campaignId: item.campaign_id,
+                            salePrice: item.sale_price,
+                            maxPerUser: item.max_quantity_per_user,
+                          }
+                        );
+                      }}
+                      variant="outline"
+                      className="p-2.5 h-10 rounded-xl border-rose-500/40 text-rose-300 hover:text-white hover:bg-rose-900/40 transition flex-shrink-0"
+                      title="Thêm vào giỏ hàng để mua cùng sản phẩm khác"
+                    >
+                      <ShoppingBag className="w-4 h-4" />
+                    </Button>
                     <Button
                       disabled={item.remaining_stock <= 0}
                       onClick={() => handleOpenBuyItem(item)}
-                      className="w-full bg-gradient-to-r from-amber-500 via-rose-600 to-red-600 hover:from-amber-600 hover:to-red-700 disabled:opacity-50 text-white font-black text-xs h-10 rounded-xl shadow-md shadow-rose-600/20 gap-1.5 group-hover:shadow-rose-600/40"
+                      className="flex-1 bg-gradient-to-r from-amber-500 via-rose-600 to-red-600 hover:from-amber-600 hover:to-red-700 disabled:opacity-50 text-white font-black text-xs h-10 rounded-xl shadow-md shadow-rose-600/20 gap-1.5 group-hover:shadow-rose-600/40"
                     >
                       <Zap className="w-4 h-4 fill-current" />
                       {item.remaining_stock > 0 ? "SĂN NGAY" : "HẾT SUẤT"}

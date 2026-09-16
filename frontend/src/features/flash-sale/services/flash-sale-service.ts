@@ -7,9 +7,11 @@ import {
   AdminCampaignItem,
   AdminCampaignListResponse,
   AdminCreateCampaignPayload,
+  BatchOfferResponse,
   CreateFlashSaleOrderPayload,
   FlashSaleOrderStatus,
   FlashSaleReservationResponse,
+  ProductOfferResponse,
 } from "../types";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -21,6 +23,28 @@ export const flashSaleService = {
   async getActiveCampaign(): Promise<ApiResponse<ActiveCampaign | null>> {
     return apiClient<ApiResponse<ActiveCampaign | null>>("/flash-sales/active", {
       method: "GET",
+    });
+  },
+
+  /**
+   * Lấy thông tin ưu đãi Flash Sale cho 1 sản phẩm
+   */
+  async getProductOffer(productId: number): Promise<ApiResponse<ProductOfferResponse>> {
+    return apiClient<ApiResponse<ProductOfferResponse>>(`/flash-sales/offers/${productId}`, {
+      method: "GET",
+    });
+  },
+
+  /**
+   * Lấy danh sách ưu đãi Flash Sale theo lô (Batch)
+   */
+  async getBatchOffers(productIds: number[]): Promise<ApiResponse<BatchOfferResponse>> {
+    if (!productIds || productIds.length === 0) {
+      return { status: 200, message: "OK", data: { offers: {} } } as unknown as ApiResponse<BatchOfferResponse>;
+    }
+    return apiClient<ApiResponse<BatchOfferResponse>>("/flash-sales/offers/batch", {
+      method: "POST",
+      body: JSON.stringify({ product_ids: productIds }),
     });
   },
 

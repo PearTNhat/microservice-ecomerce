@@ -14,6 +14,7 @@ type AppConfig struct {
 	ProductDbDns         string
 	OrderDbDns           string
 	AppSecret            string
+	QuoteSecret          string
 	RedisAddress         string
 	SMTPHost             string
 	SMTPPort             int
@@ -80,6 +81,11 @@ func LoadConfig() AppConfig {
 		orderDbDns = "host=localhost port=5428 user=root password=secret dbname=ecom_order_db sslmode=disable"
 	}
 
+	quoteSecret := os.Getenv("QUOTE_SECRET")
+	if quoteSecret == "" {
+		quoteSecret = os.Getenv("APP_SECRET")
+	}
+
 	return AppConfig{
 		ServerPort:           os.Getenv("PORT"),
 		Dns:                  defaultBaseDNS,
@@ -87,6 +93,7 @@ func LoadConfig() AppConfig {
 		ProductDbDns:         productDbDns,
 		OrderDbDns:           orderDbDns,
 		AppSecret:            os.Getenv("APP_SECRET"),
+		QuoteSecret:          quoteSecret,
 		RedisAddress:         os.Getenv("REDIS_ADDRESS"),
 		SMTPHost:             os.Getenv("SMTP_HOST"),
 		SMTPPort:             smtpPort,

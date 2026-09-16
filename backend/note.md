@@ -9,6 +9,8 @@ Em cũng muốn hỏi thêm là về SQL thì e nên tìm hiểu sâu hơn về 
 Tìm hiểu distributed transaction nhé, tiêu biểu có saga, 2pc, nên xem ưu nhược điểm mỗi loại
 
 
+" /admin/flash-sales/:campaignId/end " khi admin đóng sơm nó sử lý như nào cân hiểu sâu hơn
+
 Câu hỏi rất hay! Để hiểu rõ, chúng ta cần phân biệt giữa **môi trường máy tính của bạn hiện tại (Local/Dev)** và **môi trường thực tế khi chạy thật (Production)**:
 
 ---

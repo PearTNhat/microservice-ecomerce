@@ -63,7 +63,7 @@ func NewFlashSaleWorker(
 		GroupID:        pkgKafka.ConsumerGroupFlashSale,
 		MinBytes:       1,
 		MaxBytes:       10e6,
-		CommitInterval: time.Second,
+		CommitInterval: 0,
 	})
 
 	return &FlashSaleWorker{
@@ -105,15 +105,66 @@ func (w *FlashSaleWorker) Start(ctx context.Context) {
 					continue
 				}
 
-				result, procErr := w.processFlashSaleOrder(ctx, m)
-				switch result {
-				case ProcessingSucceeded, ProcessingTerminal:
-					_ = w.reader.CommitMessages(ctx, m)
-				case ProcessingRetryable:
-					if procErr != nil {
-						logger.WarnContext(ctx, "⚠️ FlashSaleWorker gặp lỗi có thể retry, hoãn commit message", "error", procErr.Error())
+				// 20.1 (P0): In-place retry loop cho đúng message 'm'
+				backoff := 500 * time.Millisecond
+				maxBackoff := 10 * time.Second
+				for {
+					if ctx.Err() != nil {
+						return
 					}
-					time.Sleep(1 * time.Second)
+
+					result, procErr := w.processFlashSaleOrder(ctx, m)
+					if result == ProcessingRetryable {
+						errMsg := ""
+						if procErr != nil {
+							errMsg = procErr.Error()
+						}
+						logger.WarnContext(ctx, "⚠️ FlashSaleWorker gặp lỗi retryable, retry lại đúng message này",
+							"topic", m.Topic,
+							"partition", m.Partition,
+							"offset", m.Offset,
+							"backoff", backoff.String(),
+							"error", errMsg,
+						)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+						continue
+					}
+
+					// ProcessingSucceeded or ProcessingTerminal: Synchronous commit retry
+					commitBackoff := 500 * time.Millisecond
+					for {
+						if ctx.Err() != nil {
+							return
+						}
+						if commitErr := w.reader.CommitMessages(ctx, m); commitErr != nil {
+							logger.Error("❌ FlashSaleWorker lỗi commit offset, retry commit",
+								"topic", m.Topic,
+								"partition", m.Partition,
+								"offset", m.Offset,
+								"error", commitErr.Error(),
+							)
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(commitBackoff):
+							}
+							commitBackoff *= 2
+							if commitBackoff > maxBackoff {
+								commitBackoff = maxBackoff
+							}
+							continue
+						}
+						break
+					}
+					break // Hoàn tất message 'm', fetch message tiếp theo
 				}
 			}
 		}
@@ -125,7 +176,9 @@ func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Mes
 	if err := json.Unmarshal(m.Value, &task); err != nil {
 		logger.Error("❌ FlashSaleWorker: Lỗi deserialize JSON payload", "error", err.Error())
 		if w.kafkaProducer != nil {
-			_ = w.kafkaProducer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, "Invalid JSON: "+err.Error(), "")
+			if dlqErr := w.kafkaProducer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, "Invalid JSON: "+err.Error(), ""); dlqErr != nil {
+				return ProcessingRetryable, fmt.Errorf("lỗi gửi DLQ cho json lỗi: %w", dlqErr)
+			}
 		}
 		return ProcessingTerminal, nil
 	}
@@ -140,7 +193,9 @@ func (w *FlashSaleWorker) processFlashSaleOrder(ctx context.Context, m kafka.Mes
 		errMsg := "ReservationID rỗng"
 		logger.ErrorContext(reqCtx, "❌ FlashSaleWorker payload không hợp lệ", "error", errMsg)
 		if w.kafkaProducer != nil {
-			_ = w.kafkaProducer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, errMsg, traceID)
+			if dlqErr := w.kafkaProducer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, errMsg, traceID); dlqErr != nil {
+				return ProcessingRetryable, fmt.Errorf("lỗi gửi DLQ cho payload không hợp lệ: %w", dlqErr)
+			}
 		}
 		return ProcessingTerminal, nil
 	}

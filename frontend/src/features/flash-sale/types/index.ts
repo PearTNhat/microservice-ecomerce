@@ -105,3 +105,25 @@ export interface AdminCampaignListResponse {
   limit: number;
 }
 
+// ---------------- Universal Offer Types ----------------
+export interface ProductOfferResponse {
+  has_flash_sale: boolean;
+  campaign_id?: number;
+  campaign_name?: string;
+  original_price: number;
+  sale_price: number;
+  discount_percentage?: number;
+  remaining_stock?: number;
+  max_quantity_per_user?: number;
+  max_quantity_per_order?: number;
+  ends_at?: string;
+  remaining_seconds?: number;
+  reason?: string;
+}
+
+export interface BatchOfferResponse {
+  offers: Record<number, ProductOfferResponse>;
+  quote_token?: string;
+}
+
+

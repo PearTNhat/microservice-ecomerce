@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,7 @@ func SetupOrderRoutes(rh *server.RestHandler, svc service.OrderService, redisCli
 	orderGroup := app.Group("/orders", authMiddleware)
 	orderGroup.Post("/", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
 	orderGroup.Post("/checkout", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
+	orderGroup.Post("/checkout/quote", handler.GetBasketQuote) // 17.1: Báo giá trước khi đặt hàng giỏ hàng
 	orderGroup.Post("/direct", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
 
 	// Flash Sale Routes
@@ -53,10 +55,45 @@ func (h *OrderHandler) CreateOrder(c *fiber.Ctx) error {
 
 	order, err := h.svc.CreateOrder(c.UserContext(), userID, &req)
 	if err != nil {
-		return response.BadRequest(c, err.Error(), "CREATE_ORDER_FAILED")
+		if conflictErr, ok := err.(*service.PriceConflictError); ok {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"status":     "error",
+				"message":    conflictErr.Message,
+				"error_code": conflictErr.ErrorCode,
+				"data":       conflictErr.Response,
+			})
+		}
+		errStr := err.Error()
+		if strings.Contains(errStr, "FLASH_SALE_OUT_OF_STOCK") ||
+			strings.Contains(errStr, "PRICE_CHANGED") ||
+			strings.Contains(errStr, "FLASH_SALE_QUOTA_EXCEEDED") ||
+			strings.Contains(errStr, "QUOTE_EXPIRED") {
+			return response.Error(c, fiber.StatusConflict, errStr, "CONFLICT_REQUOTE_REQUIRED")
+		}
+		return response.BadRequest(c, errStr, "CREATE_ORDER_FAILED")
 	}
 
 	return response.Success(c, http.StatusCreated, "Đặt hàng thành công", order)
+}
+
+// GetBasketQuote lấy báo giá chính xác cho giỏ hàng kèm QuoteToken (17.1)
+func (h *OrderHandler) GetBasketQuote(c *fiber.Ctx) error {
+	userID, _ := c.Locals("userID").(string)
+	if userID == "" {
+		return response.Unauthorized(c, "Bạn chưa đăng nhập")
+	}
+
+	var req dto.BasketQuoteRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Thông tin yêu cầu báo giá không hợp lệ", "INVALID_BODY")
+	}
+
+	quote, err := h.svc.GetBasketQuote(c.UserContext(), userID, &req)
+	if err != nil {
+		return response.BadRequest(c, err.Error(), "GET_QUOTE_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Báo giá giỏ hàng thành công", quote)
 }
 
 func (h *OrderHandler) CreateFlashSaleOrder(c *fiber.Ctx) error {

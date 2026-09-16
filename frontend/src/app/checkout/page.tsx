@@ -3,28 +3,43 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useCartStore } from "@/features/cart/store/useCartStore";
+import { flashSaleService } from "@/features/flash-sale/services/flash-sale-service";
 import { orderService } from "@/features/orders/services/order-service";
-import { PaymentMethod } from "@/features/orders/types";
 import { formatPrice } from "@/lib/utils";
 import {
+  AlertCircle,
   ArrowLeft,
   CheckCircle2,
   CreditCard,
+  Loader2,
   Lock,
-  MapPin,
   ShieldCheck,
   ShoppingBag,
   Truck,
   User,
+  Zap,
 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  BasketQuoteResponse,
+  PaymentMethod,
+  PriceConflictItem,
+  PriceConflictResponse,
+  QuoteLineDTO,
+} from "@/features/orders/types";
 
 export default function CheckoutPage() {
   const router = useRouter();
-  const { items, getTotalPrice, clearCart } = useCartStore();
+  const {
+    items,
+    getTotalPrice,
+    clearCart,
+    syncFlashSaleOffers,
+    hasFlashSaleItems,
+  } = useCartStore();
 
   const [formData, setFormData] = useState({
     customer_name: "",
@@ -36,9 +51,95 @@ export default function CheckoutPage() {
 
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("COD");
   const [isLoading, setIsLoading] = useState(false);
+  const [isPolling, setIsPolling] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [quoteToken, setQuoteToken] = useState<string | undefined>(undefined);
+  const [activeQuote, setActiveQuote] = useState<BasketQuoteResponse | null>(null);
+  const [quoteStatus, setQuoteStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [conflictInfo, setConflictInfo] = useState<{
+    open: boolean;
+    message: string;
+    newQuoteToken?: string;
+    newTotal?: number;
+    affectedItems?: PriceConflictItem[];
+    newItems?: QuoteLineDTO[];
+  }>({
+    open: false,
+    message: "",
+  });
 
   const totalPrice = getTotalPrice();
+  const hasFlashSale = hasFlashSaleItems();
+
+  // 19.1: Tạo fingerprint bất biến để chống re-render loop tại /checkout
+  const basketFingerprint = useMemo(() => {
+    return items
+      .map((it) => `${it.product.id}:${it.quantity}`)
+      .sort()
+      .join(",");
+  }, [items]);
+
+  // 19.1: Monotonic request ID để huỷ kết quả bất đồng bộ quá hạn
+  const currentRequestId = useRef(0);
+
+  // 17.1, 18.2, 19.1: Lấy báo giá giỏ hàng phụ thuộc DUY NHẤT vào basketFingerprint
+  useEffect(() => {
+    const currentItems = useCartStore.getState().items;
+    if (currentItems.length === 0) {
+      setQuoteStatus("idle");
+      setActiveQuote(null);
+      return;
+    }
+
+    const reqId = ++currentRequestId.current;
+    const ids = currentItems.map((it) => it.product.id);
+    const quoteItems = currentItems.map((it) => ({
+      product_id: it.product.id,
+      quantity: it.quantity,
+    }));
+
+    setQuoteStatus("loading");
+
+    orderService
+      .getBasketQuote({ items: quoteItems })
+      .then((res) => {
+        if (currentRequestId.current !== reqId) return;
+        if (res.data && res.data.quote_token) {
+          setQuoteToken(res.data.quote_token);
+          setActiveQuote(res.data);
+          setQuoteStatus("ready");
+        } else {
+          setQuoteStatus("error");
+          setErrorMsg("Không nhận được báo giá hợp lệ từ máy chủ.");
+        }
+      })
+      .catch(() => {
+        if (currentRequestId.current !== reqId) return;
+        setQuoteStatus("error");
+        setErrorMsg("Không thể tải báo giá sản phẩm. Vui lòng thử lại hoặc tải lại trang.");
+      });
+
+    flashSaleService
+      .getBatchOffers(ids)
+      .then((res) => {
+        if (currentRequestId.current !== reqId) return;
+        if (res.data && res.data.offers) {
+          syncFlashSaleOffers(res.data.offers);
+        }
+      })
+      .catch(() => {});
+  }, [basketFingerprint, syncFlashSaleOffers]);
+
+  const effectiveHasFlashSale = activeQuote
+    ? activeQuote.items.some((i) => i.is_flash_sale)
+    : hasFlashSale;
+
+  // Bắt buộc chuyển sang COD nếu đơn hàng đang chứa Flash Sale
+  useEffect(() => {
+    if (effectiveHasFlashSale) {
+      setPaymentMethod("COD");
+    }
+  }, [effectiveHasFlashSale]);
 
   // Tự động điền thông tin nếu đã đăng nhập
   useEffect(() => {
@@ -81,6 +182,11 @@ export default function CheckoutPage() {
       return;
     }
 
+    if (hasFlashSale && paymentMethod !== "COD") {
+      setErrorMsg("Đơn hàng có sản phẩm Flash Sale chỉ hỗ trợ hình thức thanh toán khi nhận hàng (COD).");
+      return;
+    }
+
     setIsLoading(true);
 
     try {
@@ -103,21 +209,81 @@ export default function CheckoutPage() {
           note: formData.note,
           payment_method: paymentMethod,
           from_cart: false,
+          quote_token: quoteToken,
           items: orderItems,
         },
         idempotencyKey
       );
 
       if (res && res.data) {
+        const orderId = res.data.id;
+
+        // Nếu đơn hàng có Flash Sale và trạng thái ban đầu là PENDING (do 2-phase async Saga)
+        if (res.data.order_status === "PENDING" && hasFlashSale) {
+          setIsPolling(true);
+          let finalStatus = "PENDING";
+          for (let attempt = 0; attempt < 8; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            try {
+              const detail = await orderService.getOrderByID(orderId);
+              if (detail.data && detail.data.order_status) {
+                finalStatus = detail.data.order_status;
+                if (finalStatus === "CONFIRMED") {
+                  break;
+                }
+                if (finalStatus === "CANCELLED") {
+                  setErrorMsg(
+                    "Đơn hàng không thể hoàn tất do sản phẩm Flash Sale hoặc tồn kho thường đã hết suất ưu đãi!"
+                  );
+                  setIsLoading(false);
+                  setIsPolling(false);
+                  return;
+                }
+              }
+            } catch (pollErr) {
+              // Bỏ qua lỗi polling tạm thời và thử lại
+            }
+          }
+        }
+
         // 4. Xóa giỏ hàng sau khi đặt thành công
         clearCart();
         // 5. Điều hướng sang trang chi tiết đơn hàng
         router.push(`/orders/${res.data.id}?created=true`);
       }
     } catch (err: any) {
-      setErrorMsg(err.message || "Đặt hàng không thành công. Vui lòng thử lại!");
+      const isConflict =
+        err.response?.status === 409 ||
+        (err.message &&
+          (err.message.includes("FLASH_SALE_OUT_OF_STOCK") ||
+            err.message.includes("PRICE_CHANGED") ||
+            err.message.includes("FLASH_SALE_QUOTA_EXCEEDED") ||
+            err.message.includes("CONFLICT_REQUOTE_REQUIRED")));
+
+      if (isConflict) {
+        const conflictData: PriceConflictResponse | undefined =
+          err.response?.data?.data || err.response?.data;
+        const msg =
+          conflictData?.message ||
+          err.response?.data?.message ||
+          err.message ||
+          "Một số sản phẩm Flash Sale đã thay đổi giá hoặc hết suất ưu đãi.";
+
+        setConflictInfo({
+          open: true,
+          message: msg,
+          newQuoteToken: conflictData?.new_quote_token,
+          newTotal: conflictData?.new_total,
+          affectedItems: conflictData?.affected_items,
+          newItems: conflictData?.new_items,
+        });
+        setErrorMsg(msg);
+      } else {
+        setErrorMsg(err.message || "Đặt hàng không thành công. Vui lòng thử lại!");
+      }
     } finally {
       setIsLoading(false);
+      setIsPolling(false);
     }
   };
 
@@ -145,6 +311,118 @@ export default function CheckoutPage() {
   return (
     <div className="min-h-screen bg-slate-50/50 dark:bg-slate-950 py-10">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Modal Xung Đột Giá / Hết Suất Flash Sale (HTTP 409 Conflict Re-quote) */}
+        {conflictInfo.open && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white dark:bg-slate-900 rounded-3xl p-6 sm:p-8 max-w-lg w-full shadow-2xl border border-amber-200 dark:border-amber-800 space-y-5">
+              <div className="flex items-center gap-3 text-amber-600 dark:text-amber-400">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 dark:bg-amber-950/80 flex items-center justify-center">
+                  <Zap className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900 dark:text-white">
+                    Thông báo cập nhật ưu đãi Flash Sale
+                  </h3>
+                  <p className="text-xs text-slate-500">Mã lỗi: HTTP 409 Conflict (Re-quote)</p>
+                </div>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200/60 dark:border-amber-900/60 text-sm text-slate-700 dark:text-slate-300">
+                {conflictInfo.message}
+              </div>
+
+              {/* 18.4: Danh sách chi tiết sản phẩm bị biến động giá / hết suất sale */}
+              {conflictInfo.affectedItems && conflictInfo.affectedItems.length > 0 && (
+                <div className="space-y-2 border border-slate-200 dark:border-slate-800 rounded-2xl p-3 bg-slate-50/50 dark:bg-slate-950/50">
+                  <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">
+                    Chi tiết sản phẩm thay đổi:
+                  </p>
+                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                    {conflictInfo.affectedItems.map((item, idx) => {
+                      let reasonLabel = "Thay đổi giá";
+                      if (item.reason === "FLASH_SALE_OUT_OF_STOCK") reasonLabel = "Hết suất sale";
+                      else if (item.reason === "FLASH_SALE_EXPIRED") reasonLabel = "Hết hạn campaign";
+                      else if (item.reason === "FLASH_SALE_QUOTA_EXCEEDED") reasonLabel = "Vượt giới hạn mua";
+
+                      return (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between text-xs p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800"
+                        >
+                          <div className="flex-1 min-w-0 pr-2">
+                            <p className="font-semibold text-slate-800 dark:text-slate-200 truncate">
+                              {item.product_name}
+                            </p>
+                            <span className="inline-block mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300">
+                              {reasonLabel}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="line-through text-slate-400 text-[11px] block">
+                              {formatPrice(item.quoted_price)}
+                            </span>
+                            <span className="font-bold text-rose-600 dark:text-rose-400">
+                              {formatPrice(item.updated_price)}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* 18.4: Hiển thị tổng tiền mới dự tính */}
+              {conflictInfo.newTotal !== undefined && (
+                <div className="p-3 bg-slate-100 dark:bg-slate-800/80 rounded-xl flex justify-between items-center text-sm font-semibold">
+                  <span className="text-slate-700 dark:text-slate-300">Tổng tiền mới dự tính:</span>
+                  <span className="text-base font-black text-rose-600 dark:text-rose-400">
+                    {formatPrice(conflictInfo.newTotal)}
+                  </span>
+                </div>
+              )}
+
+              <p className="text-xs text-slate-500">
+                Hệ thống không tự ý trừ tiền của bạn khi giá thay đổi. Bạn có thể chọn tiếp tục đặt hàng với giá hiện hành hoặc quay lại giỏ hàng.
+              </p>
+
+              <div className="flex flex-col sm:flex-row gap-3 pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="flex-1 rounded-xl"
+                  onClick={() => router.push("/cart")}
+                >
+                  Quay lại giỏ hàng
+                </Button>
+                <Button
+                  type="button"
+                  className="flex-1 rounded-xl bg-amber-600 hover:bg-amber-700 text-white shadow-lg shadow-amber-600/25"
+                  onClick={() => {
+                    if (conflictInfo.newQuoteToken) {
+                      setQuoteToken(conflictInfo.newQuoteToken);
+                      if (conflictInfo.newItems && conflictInfo.newTotal !== undefined) {
+                        setActiveQuote({
+                          quote_token: conflictInfo.newQuoteToken,
+                          total: conflictInfo.newTotal,
+                          expires_at: Date.now() + 15 * 60 * 1000,
+                          items: conflictInfo.newItems,
+                        });
+                      }
+                      setQuoteStatus("ready");
+                    }
+                    syncFlashSaleOffers({});
+                    setConflictInfo({ open: false, message: "" });
+                    setErrorMsg(null);
+                  }}
+                >
+                  Chấp nhận mua giá thường
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Header Breadcrumb */}
         <div className="mb-8">
           <Link
@@ -302,7 +580,14 @@ export default function CheckoutPage() {
                     {paymentMethod === "COD" && <div className="w-2 h-2 rounded-full bg-white" />}
                   </div>
                   <div>
-                    <span className="text-sm font-bold block">Thanh toán khi nhận hàng (COD)</span>
+                    <span className="text-sm font-bold flex items-center gap-1.5">
+                      Thanh toán khi nhận hàng (COD)
+                      {hasFlashSale && (
+                        <span className="text-[10px] bg-rose-600 text-white font-black px-1.5 py-0.5 rounded">
+                          BẮT BUỘC CHO FLASH SALE
+                        </span>
+                      )}
+                    </span>
                     <span className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 block">
                       Kiểm tra hàng rồi thanh toán tiền mặt cho shipper
                     </span>
@@ -311,11 +596,16 @@ export default function CheckoutPage() {
 
                 {/* Lựa chọn 2: VNPAY / QR */}
                 <div
-                  onClick={() => setPaymentMethod("VNPAY")}
-                  className={`cursor-pointer p-4 rounded-2xl border-2 transition-all flex items-start gap-3 ${
-                    paymentMethod === "VNPAY"
-                      ? "border-blue-600 bg-blue-50/50 dark:bg-blue-950/30 text-blue-900 dark:text-blue-200"
-                      : "border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700"
+                  onClick={() => {
+                    if (effectiveHasFlashSale) return;
+                    setPaymentMethod("VNPAY");
+                  }}
+                  className={`p-4 rounded-2xl border-2 transition-all flex items-start gap-3 ${
+                    effectiveHasFlashSale
+                      ? "opacity-40 cursor-not-allowed border-slate-200 dark:border-slate-800 bg-slate-100/50 dark:bg-slate-800/30"
+                      : paymentMethod === "VNPAY"
+                      ? "cursor-pointer border-blue-600 bg-blue-50/50 dark:bg-blue-950/30 text-blue-900 dark:text-blue-200"
+                      : "cursor-pointer border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700"
                   }`}
                 >
                   <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center mt-0.5 ${
@@ -326,7 +616,9 @@ export default function CheckoutPage() {
                   <div>
                     <span className="text-sm font-bold block">VNPAY / Quét mã QR</span>
                     <span className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 block">
-                      Thanh toán tức thì qua ứng dụng Ngân hàng
+                      {effectiveHasFlashSale
+                        ? "Tạm khóa do đơn hàng có Flash Sale (chỉ hỗ trợ COD)"
+                        : "Thanh toán tức thì qua ứng dụng Ngân hàng"}
                     </span>
                   </div>
                 </div>
@@ -339,85 +631,176 @@ export default function CheckoutPage() {
             <div className="sticky top-24 bg-white dark:bg-slate-900 rounded-3xl p-6 sm:p-8 shadow-sm border border-slate-100 dark:border-slate-800 space-y-6">
               <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
                 <h3 className="text-lg font-bold text-slate-900 dark:text-white">
-                  Đơn hàng của bạn ({items.length} món)
+                  Đơn hàng của bạn ({activeQuote?.items ? activeQuote.items.length : items.length} món)
                 </h3>
                 <Link href="/products" className="text-xs font-semibold text-blue-600 hover:underline">
                   Thay đổi
                 </Link>
               </div>
 
-              {/* Danh sách món hàng */}
+              {/* 19.4: Render danh sách món hàng trực tiếp từ activeQuote máy chủ xác nhận */}
               <div className="max-h-72 overflow-y-auto space-y-3 pr-1">
-                {items.map(({ product, quantity }) => {
-                  const currentPrice = product.discount_price || product.price;
-                  const itemSubtotal = currentPrice * quantity;
+                {activeQuote && activeQuote.items && activeQuote.items.length > 0
+                  ? activeQuote.items.map((line) => {
+                      const cartItem = items.find((it) => it.product.id === line.product_id);
+                      const originalPrice = cartItem?.product.price || line.unit_price;
+                      const thumbnail = cartItem?.product.thumbnail;
 
-                  return (
-                    <div key={product.id} className="flex gap-3 items-center">
-                      <div className="relative w-14 h-14 rounded-xl overflow-hidden bg-slate-50 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700 flex-shrink-0">
-                        {product.thumbnail ? (
-                          <Image
-                            src={product.thumbnail}
-                            alt={product.name}
-                            fill
-                            className="object-cover"
-                            sizes="56px"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
-                            Ảnh
+                      return (
+                        <div key={line.product_id} className="flex gap-3 items-center">
+                          <div className="relative w-14 h-14 rounded-xl overflow-hidden bg-slate-50 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700 flex-shrink-0">
+                            {thumbnail ? (
+                              <Image
+                                src={thumbnail}
+                                alt={line.product_name}
+                                fill
+                                className="object-cover"
+                                sizes="56px"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
+                                Ảnh
+                              </div>
+                            )}
+                            {line.is_flash_sale && (
+                              <div className="absolute top-0.5 left-0.5 bg-rose-600 text-white text-[8px] font-black px-1 rounded">
+                                SALE
+                              </div>
+                            )}
                           </div>
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 line-clamp-1">
-                          {product.name}
-                        </p>
-                        <p className="text-[11px] text-slate-400 mt-0.5">
-                          {formatPrice(currentPrice)} × {quantity}
-                        </p>
-                      </div>
-                      <div className="text-xs font-bold text-slate-900 dark:text-white text-right">
-                        {formatPrice(itemSubtotal)}
-                      </div>
-                    </div>
-                  );
-                })}
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 line-clamp-1">
+                              {line.product_name}
+                            </p>
+                            <div className="flex items-center gap-1.5 text-[11px] text-slate-400 mt-0.5">
+                              <span className={line.is_flash_sale ? "text-rose-600 font-bold" : ""}>
+                                {formatPrice(line.unit_price)}
+                              </span>
+                              {line.is_flash_sale && originalPrice > line.unit_price && (
+                                <span className="line-through text-[10px]">{formatPrice(originalPrice)}</span>
+                              )}
+                              <span>× {line.quantity}</span>
+                            </div>
+                          </div>
+                          <div className="text-xs font-bold text-slate-900 dark:text-white text-right">
+                            {formatPrice(line.subtotal)}
+                          </div>
+                        </div>
+                      );
+                    })
+                  : items.map(({ product, quantity, isFlashSale, salePrice }) => {
+                      const currentPrice =
+                        isFlashSale && salePrice
+                          ? salePrice
+                          : product.discount_price || product.price;
+                      const itemSubtotal = currentPrice * quantity;
+
+                      return (
+                        <div key={product.id} className="flex gap-3 items-center">
+                          <div className="relative w-14 h-14 rounded-xl overflow-hidden bg-slate-50 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700 flex-shrink-0">
+                            {product.thumbnail ? (
+                              <Image
+                                src={product.thumbnail}
+                                alt={product.name}
+                                fill
+                                className="object-cover"
+                                sizes="56px"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-400">
+                                Ảnh
+                              </div>
+                            )}
+                            {isFlashSale && (
+                              <div className="absolute top-0.5 left-0.5 bg-rose-600 text-white text-[8px] font-black px-1 rounded">
+                                SALE
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 line-clamp-1">
+                              {product.name}
+                            </p>
+                            <div className="flex items-center gap-1.5 text-[11px] text-slate-400 mt-0.5">
+                              <span className={isFlashSale ? "text-rose-600 font-bold" : ""}>
+                                {formatPrice(currentPrice)}
+                              </span>
+                              {isFlashSale && product.price > currentPrice && (
+                                <span className="line-through text-[10px]">{formatPrice(product.price)}</span>
+                              )}
+                              <span>× {quantity}</span>
+                            </div>
+                          </div>
+                          <div className="text-xs font-bold text-slate-900 dark:text-white text-right">
+                            {formatPrice(itemSubtotal)}
+                          </div>
+                        </div>
+                      );
+                    })}
               </div>
 
               {/* Bảng tính tổng tiền */}
-              <div className="pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2 text-sm">
-                <div className="flex justify-between text-slate-500">
-                  <span>Tạm tính:</span>
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {formatPrice(totalPrice)}
-                  </span>
-                </div>
-                <div className="flex justify-between text-slate-500">
-                  <span className="flex items-center gap-1">
-                    <Truck className="w-3.5 h-3.5 text-emerald-600" /> Phí vận chuyển:
-                  </span>
-                  <span className="font-semibold text-emerald-600">Miễn phí toàn quốc</span>
-                </div>
-                <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex justify-between items-baseline">
-                  <span className="text-base font-bold text-slate-900 dark:text-white">Tổng thanh toán:</span>
-                  <div className="text-right">
-                    <span className="text-2xl font-black text-blue-600 dark:text-blue-400 block">
-                      {formatPrice(totalPrice)}
-                    </span>
-                    <span className="text-[11px] text-slate-400">Đã bao gồm thuế VAT</span>
+              {(() => {
+                const finalPayableTotal = activeQuote ? activeQuote.total : totalPrice;
+                return (
+                  <div className="pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2 text-sm">
+                    <div className="flex justify-between text-slate-500">
+                      <span>Tạm tính:</span>
+                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                        {formatPrice(finalPayableTotal)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-slate-500">
+                      <span className="flex items-center gap-1">
+                        <Truck className="w-3.5 h-3.5 text-emerald-600" /> Phí vận chuyển:
+                      </span>
+                      <span className="font-semibold text-emerald-600">Miễn phí toàn quốc</span>
+                    </div>
+                    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex justify-between items-baseline">
+                      <span className="text-base font-bold text-slate-900 dark:text-white">Tổng thanh toán:</span>
+                      <div className="text-right">
+                        <span className="text-2xl font-black text-blue-600 dark:text-blue-400 block">
+                          {formatPrice(finalPayableTotal)}
+                        </span>
+                        <span className="text-[11px] text-slate-400">Đã bao gồm thuế VAT</span>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
+                );
+              })()}
 
               {/* Nút Đặt Hàng */}
               <Button
                 type="submit"
                 size="lg"
-                className="w-full shadow-xl shadow-blue-500/25 py-4 text-base font-bold tracking-wide"
-                isLoading={isLoading}
+                className={`w-full py-4 text-base font-bold tracking-wide shadow-xl ${
+                  effectiveHasFlashSale
+                    ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 shadow-rose-600/25"
+                    : "shadow-blue-500/25"
+                }`}
+                disabled={isLoading || isPolling || quoteStatus !== "ready" || !quoteToken}
               >
-                <Lock className="w-4 h-4 mr-2" /> XÁC NHẬN ĐẶT HÀNG
+                {quoteStatus === "loading" ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Đang tải báo giá...
+                  </span>
+                ) : quoteStatus === "error" ? (
+                  <span className="flex items-center gap-2">
+                    <AlertCircle className="w-5 h-5" />
+                    Lỗi báo giá - Vui lòng thử lại
+                  </span>
+                ) : isPolling ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Đang xác nhận giữ chỗ Flash Sale...
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <Lock className="w-4 h-4" />
+                    {effectiveHasFlashSale ? "⚡ XÁC NHẬN ĐƠN FLASH SALE (COD)" : "XÁC NHẬN ĐẶT HÀNG"}
+                  </span>
+                )}
               </Button>
 
               <div className="text-center text-[11px] text-slate-400 space-y-1">

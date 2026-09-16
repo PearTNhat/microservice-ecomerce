@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"ecomerce-service/pkg/middlewares"
@@ -47,6 +48,9 @@ func SetupFlashSaleRoutes(rh *server.RestHandler, svc service.FlashSaleService, 
 	// Customer & Public API
 	fsGroup := app.Group("/flash-sales")
 	fsGroup.Get("/active", handler.GetActiveCampaign)
+	fsGroup.Get("/offers/batch", handler.GetBatchOffers)
+	fsGroup.Post("/offers/batch", handler.GetBatchOffers)
+	fsGroup.Get("/offers/:productId", handler.GetProductOffer)
 	fsGroup.Post("/:campaignId/items/:productId/orders", authMiddleware, handler.ReserveOrder)
 	fsGroup.Get("/orders/:reservationId", authMiddleware, handler.GetOrderStatus)
 	fsGroup.Get("/orders/:reservationId/stream", handler.StreamOrderStatus)
@@ -293,4 +297,54 @@ func (h *FlashSaleHandler) StreamOrderStatus(c *fiber.Ctx) error {
 	}))
 
 	return nil
+}
+
+func (h *FlashSaleHandler) GetProductOffer(c *fiber.Ctx) error {
+	productID, err := c.ParamsInt("productId")
+	if err != nil || productID <= 0 {
+		return response.BadRequest(c, "Mã sản phẩm không hợp lệ", "INVALID_PRODUCT_ID")
+	}
+
+	userID, _ := c.Locals("userID").(string)
+	if userID == "" {
+		userID, _ = c.Locals("userId").(string)
+	}
+	resp, err := h.svc.GetProductOffer(c.UserContext(), uint(productID), userID)
+	if err != nil {
+		return response.Error(c, http.StatusInternalServerError, err.Error(), "GET_OFFER_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Lấy thông tin ưu đãi thành công", resp)
+}
+
+func (h *FlashSaleHandler) GetBatchOffers(c *fiber.Ctx) error {
+	var req dto.BatchOfferRequest
+	if c.Method() == fiber.MethodPost {
+		if err := c.BodyParser(&req); err != nil {
+			return response.BadRequest(c, "Dữ liệu yêu cầu không hợp lệ", "INVALID_REQUEST")
+		}
+	} else {
+		// GET query params (e.g. ?ids=1,2,3)
+		idsParam := c.Query("ids")
+		if idsParam != "" {
+			var ids []uint
+			for _, part := range strings.Split(idsParam, ",") {
+				if id, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && id > 0 {
+					ids = append(ids, uint(id))
+				}
+			}
+			req.ProductIDs = ids
+		}
+	}
+
+	userID, _ := c.Locals("userID").(string)
+	if userID == "" {
+		userID, _ = c.Locals("userId").(string)
+	}
+	resp, err := h.svc.GetBatchProductOffers(c.UserContext(), req.ProductIDs, userID)
+	if err != nil {
+		return response.Error(c, http.StatusInternalServerError, err.Error(), "GET_BATCH_OFFERS_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Lấy danh sách ưu đãi thành công", resp)
 }

@@ -38,6 +38,8 @@ export async function generateMetadata({ params }: ProductDetailPageProps) {
   }
 }
 
+import { flashSaleService } from "@/features/flash-sale/services/flash-sale-service";
+
 export default async function ProductDetailPage({ params }: ProductDetailPageProps) {
   const { id } = await params;
   const productId = Number(id);
@@ -47,9 +49,16 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
   }
 
   let product;
+  let offer = null;
   try {
-    const res = await productService.getProductDetail(productId);
-    product = res.data;
+    const [productRes, offerRes] = await Promise.all([
+      productService.getProductDetail(productId),
+      flashSaleService.getProductOffer(productId).catch(() => null),
+    ]);
+    product = productRes.data;
+    if (offerRes && offerRes.data && offerRes.data.has_flash_sale) {
+      offer = offerRes.data;
+    }
   } catch (error) {
     notFound();
   }
@@ -58,8 +67,15 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
     notFound();
   }
 
-  const discountPercent = calculateDiscount(product.price, product.discount_price);
-  const currentPrice = product.discount_price || product.price;
+  const hasFlashSale = Boolean(offer && offer.has_flash_sale);
+  const currentPrice = offer && offer.has_flash_sale
+    ? offer.sale_price
+    : product.discount_price || product.price;
+
+  const originalPrice = product.price;
+  const discountPercent = offer && offer.has_flash_sale && offer.discount_percentage
+    ? offer.discount_percentage
+    : calculateDiscount(product.price, product.discount_price);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-10">
@@ -111,10 +127,17 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
 
             {/* Badges */}
             <div className="absolute top-4 left-4 flex flex-col gap-1.5 z-10">
-              {discountPercent > 0 && (
-                <Badge variant="danger" className="text-sm px-3 py-1 font-black shadow-md">
-                  Giảm {discountPercent}%
-                </Badge>
+              {hasFlashSale ? (
+                <div className="inline-flex items-center gap-1.5 bg-gradient-to-r from-red-600 to-rose-600 text-white font-black text-xs px-3 py-1.5 rounded-xl shadow-lg animate-pulse">
+                  <Zap className="w-4 h-4 fill-current text-yellow-300" />
+                  <span>FLASH SALE ĐANG DIỄN RA -{discountPercent}%</span>
+                </div>
+              ) : (
+                discountPercent > 0 && (
+                  <Badge variant="danger" className="text-sm px-3 py-1 font-black shadow-md">
+                    Giảm {discountPercent}%
+                  </Badge>
+                )
               )}
               {product.brand && (
                 <Badge variant="default" className="text-xs px-3 py-1 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md shadow-md">
@@ -152,14 +175,36 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
           </div>
 
           {/* Pricing Box */}
-          <div className="p-5 rounded-2xl bg-blue-50/50 dark:bg-slate-900 border border-blue-100 dark:border-slate-800 space-y-2">
-            <div className="flex items-baseline gap-3">
-              <span className="text-3xl sm:text-4xl font-black text-blue-600 dark:text-blue-400">
+          <div
+            className={`p-5 rounded-2xl border space-y-2 ${
+              hasFlashSale
+                ? "bg-rose-50/50 dark:bg-rose-950/20 border-rose-200 dark:border-rose-900/60 shadow-lg shadow-rose-500/5"
+                : "bg-blue-50/50 dark:bg-slate-900 border-blue-100 dark:border-slate-800"
+            }`}
+          >
+            {hasFlashSale && (
+              <div className="flex items-center justify-between text-xs font-bold text-rose-600 dark:text-rose-400 pb-1 border-b border-rose-100 dark:border-rose-900/40">
+                <span className="flex items-center gap-1">
+                  <Zap className="w-3.5 h-3.5 fill-current" /> GIÁ ƯU ĐÃI FLASH SALE
+                </span>
+                {offer?.remaining_stock !== undefined && (
+                  <span>Còn {offer.remaining_stock} suất giá sốc</span>
+                )}
+              </div>
+            )}
+            <div className="flex items-baseline gap-3 pt-1">
+              <span
+                className={`text-3xl sm:text-4xl font-black ${
+                  hasFlashSale
+                    ? "text-rose-600 dark:text-rose-400"
+                    : "text-blue-600 dark:text-blue-400"
+                }`}
+              >
                 {formatPrice(currentPrice)}
               </span>
-              {product.discount_price && product.discount_price < product.price && (
+              {originalPrice > currentPrice && (
                 <span className="text-base text-slate-400 line-through">
-                  {formatPrice(product.price)}
+                  {formatPrice(originalPrice)}
                 </span>
               )}
             </div>
@@ -168,20 +213,28 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
                 <CheckCircle2 className="w-4 h-4" />
                 <span>Giá đã bao gồm VAT và bảo hành chính hãng</span>
               </div>
-              <div className={`text-xs font-bold px-2.5 py-1 rounded-full ${
-                product.stock > 5
-                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+              <div
+                className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+                  hasFlashSale
+                    ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
+                    : product.stock > 5
+                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                    : product.stock > 0
+                    ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                    : "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
+                }`}
+              >
+                {hasFlashSale && offer?.remaining_stock !== undefined
+                  ? `Flash Sale: Còn ${offer.remaining_stock} suất`
                   : product.stock > 0
-                  ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
-                  : "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
-              }`}>
-                {product.stock > 0 ? `Tồn kho: ${product.stock} chiếc` : "Tạm hết hàng"}
+                  ? `Tồn kho: ${product.stock} chiếc`
+                  : "Tạm hết hàng"}
               </div>
             </div>
           </div>
 
           {/* Add to Cart Client Action */}
-          <AddToCartButton product={product} />
+          <AddToCartButton product={product} initialOffer={offer} />
 
           {/* Guarantees Box */}
           <div className="grid grid-cols-2 gap-3 pt-4 border-t border-slate-100 dark:border-slate-800 text-xs">

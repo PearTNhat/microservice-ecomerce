@@ -38,7 +38,7 @@ func NewOrderSagaWorker(
 		GroupID:        pkgKafka.ConsumerGroupOrderSaga,
 		MinBytes:       1,
 		MaxBytes:       10e6,
-		CommitInterval: time.Second,
+		CommitInterval: 0,
 	})
 
 	return &OrderSagaWorker{
@@ -78,7 +78,27 @@ func (w *OrderSagaWorker) Start(ctx context.Context) {
 				}
 
 				w.processMessage(ctx, m)
-				_ = w.reader.CommitMessages(ctx, m)
+
+				commitBackoff := 500 * time.Millisecond
+				for {
+					if ctx.Err() != nil {
+						return
+					}
+					if commitErr := w.reader.CommitMessages(ctx, m); commitErr != nil {
+						logger.Error("❌ OrderSagaWorker lỗi commit offset, retry commit", "error", commitErr.Error())
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(commitBackoff):
+						}
+						commitBackoff *= 2
+						if commitBackoff > 10*time.Second {
+							commitBackoff = 10 * time.Second
+						}
+						continue
+					}
+					break
+				}
 			}
 		}
 	}()

@@ -90,10 +90,37 @@ backend/
 
 ### 2.3. Event-Driven Messaging (100% Apache Kafka)
 * Mọi giao dịch phân tán giữa các service được xử lý qua mô hình **Saga Choreography** với Kafka:
-  * `order-service` phát sự kiện `order.created` lên topic `order.events`.
-  * `product-service` lắng nghe, trừ kho trong `ecom_product_db` rồi phát `stock.events`.
+  * Checkout hàng thường và giỏ hỗn hợp ghi order `PENDING` cùng `mixed.stock.request` outbox trong Order DB transaction.
+  * `product-service` xử lý stock request với operation ledger và Product DB outbox; phát `mixed.stock.result` bền vững.
+  * `order-service` chỉ phát `order.created` sau khi stock result thành công và order `CONFIRMED`; Product Service không trừ kho từ `order.created` lần nữa.
+  * Legacy `ProductStockWorker`/`OrderSagaWorker` (`order.created → stock.events`) không được khởi chạy. Trước khi nâng cấp môi trường có backlog luồng cũ, phải đối soát/migrate các order `PENDING` và offset liên quan; không reset offset để xử lý lại mù quáng.
   * Nếu thành công, `order-service` chuyển trạng thái đơn sang `CONFIRMED`.
   * Nếu thất bại, đơn được bù trừ `CANCELLED` và tự động hoàn kho / ghi nhận vào Dead Letter Topic `orders.dead_letter`.
+
+### 2.4. Tiêu Chuẩn Cam Kết Offset & Độ Bền Vững Kafka Consumer (Consumer Integrity Invariant)
+* **Synchronous Commit (`CommitInterval: 0`)**: Toàn bộ reader xử lý giao dịch Saga (`mixed.stock.request`, `mixed.stock.compensate`, `mixed.stock.result`, `mixed.stock.compensate_result`, `flashsale.confirmed`, `flashsale.orders`) thiết lập `CommitInterval: 0` để lệnh `CommitMessages` gửi yêu cầu đồng bộ trực tiếp tới Kafka broker, bảo đảm broker ghi nhận offset bền vững trước khi tiếp tục.
+* **In-Place Retry Loop (Chống Bỏ Qua Offset Lỗi)**: Tuyệt đối không sử dụng mẫu `FetchMessage -> error -> continue -> FetchMessage`. Khi một message `m` gặp lỗi kết nối DB hoặc deadlock, consumer thực hiện vòng retry nội bộ cho chính `m` với exponential backoff. Tuyệt đối không fetch message kế tiếp trên partition khi `m` chưa đạt trạng thái bền vững (durable state).
+* **Cam Kết Sau Kết Quả Bền Vững**: Offset chỉ được commit sau khi DB transaction đã hoàn tất thành công hoặc sự kiện đã được gửi sang Dead Letter Queue (DLQ) thành công. Nếu gửi DLQ lỗi, consumer tiếp tục retry thay vì commit bỏ sót.
+* **Commit Retry Loop**: Nếu gọi `CommitMessages` gặp lỗi mạng tạm thời, consumer thử lại việc commit cho đến khi broker phản hồi thành công trước khi chuyển sang fetch message tiếp theo.
+
+### 2.5. Hệ Thống Flash Sale & Giỏ Hàng Hỗn Hợp (Flash Sale & Mixed-Cart Engine)
+Hệ thống hỗ trợ 2 luồng đặt hàng Flash Sale độc lập, được mô tả chi tiết tại [FLASH_SALE_ARCHITECTURE.md](FLASH_SALE_ARCHITECTURE.md):
+
+1. **Luồng 1: Standalone Hot-Path (Mua ngay 1 chạm / Tranh mua siêu tốc)**:
+   - **Endpoint**: `POST /flash-sales/:campaignId/items/:productId/orders` (COD-only).
+   - **Tầng Hot-Path In-Memory**: Chặn đứng 99% tải tranh mua tại Redis Cluster thông qua Atomic Lua Script (`ReserveFlashSaleStock`). Kiểm tra quota người dùng và trừ kho trong RAM chỉ mất vài mili-giây.
+   - **Tầng Bền Vững**: Ghi bản ghi `flash_sale_reservations` (RESERVED) kèm Outbox Event trong 1 Transaction tại `ecom_order_db`. Trả về `202 Accepted` ngay lập tức.
+   - **Realtime Notification**: Khách hàng mở kết nối **Server-Sent Events (SSE)** `/flash-sales/orders/:id/stream` nhận kết quả `CONFIRMED` realtime từ Redis Pub/Sub khi `FlashSaleWorker` hoàn tất tạo đơn.
+   - **Đồng bộ Sổ Cái**: Sự kiện `flashsale.confirmed` gửi sang Product Service để tăng `sold_quantity` trên bảng `product_stock_allocations` (bảo vệ chống trùng lặp bằng `processed_events`).
+
+2. **Luồng 2: Mixed-Cart Checkout (Giỏ hàng hỗn hợp Flash Sale + Hàng thường)**:
+   - **Endpoint**: `POST /orders/checkout/quote` (Báo giá & Ký số `QuoteToken` HMAC-SHA256) và `POST /orders/checkout` (Đặt hàng).
+   - **Bảo Vệ Giá & Chống Bán Âm Thầm (HTTP 409 Re-Quote)**: Nếu suất Flash Sale hết hàng, khách vượt quota hoặc giá thay đổi sau khi quote, hệ thống trả về mã lỗi `409 Conflict` kèm `new_quote_token` mới và danh sách `affected_items`. Buộc người dùng xác nhận giá mới trên giao diện, không tự ý chuyển sang giá thường.
+   - **Giao Dịch Kép Nguyên Tử Tại Order DB**: Tạo Order (status `PENDING`), tạo `flash_sale_reservations` với `FlashSaleItemID` chính xác, tăng `reserved_stock` có điều kiện, và ghi Outbox `MIXED_STOCK_DEDUCT_REQUEST` (topic `mixed.stock.request`) trong cùng 1 Transaction duy nhất.
+   - **Saga Trừ Kho Có Operation Ledger (Product Service)**: `MixedOrderStockWorker` quản lý trạng thái trừ kho bằng bảng `mixed_order_stock_operations` với `SELECT ... FOR UPDATE` theo `order_id`. Trừ kho thường và trả kết quả qua topic `mixed.stock.result`.
+   - **Bồi Hoàn Hai Chiều & Chống Treo Kho**: Nếu trừ kho thường thất bại hoặc suất Flash Sale hết hạn trong lúc chờ, hệ thống phát Outbox `mixed.stock.compensate` để Product Service hoàn kho `products.stock`. Xử lý an toàn trường hợp Late Success (kết quả thành công đến muộn khi đơn đã bị hủy).
+   - **Drain Barrier & Settlement Barrier Khi Kết Thúc Campaign**: Chiến dịch sale chỉ được giải phóng kho thừa về `products.stock` khi toàn bộ suất giữ chỗ giỏ hỗn hợp đã xả cạn (`reserved_stock == 0`) và sổ cái Product DB khớp chính xác 100% với Order DB (`Product.sold == Order.sold`).
+
 
 ---
 

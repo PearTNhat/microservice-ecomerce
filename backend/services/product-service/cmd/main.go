@@ -48,13 +48,15 @@ func main() {
 	// 4. Khởi tạo REST Server & DB (Dùng riêng database ecom_product_db)
 	srv := server.NewServer(appConfig)
 
-	// AutoMigrate bảng Category, Brand, Product, ProductStockAllocation, ProcessedEvent
+	// AutoMigrate bảng Category, Brand, Product, ProductStockAllocation, ProcessedEvent, MixedOrderStockOperation
 	err := srv.DB.AutoMigrate(
 		&domain.Category{},
 		&domain.Brand{},
 		&domain.Product{},
 		&domain.ProductStockAllocation{},
 		&domain.ProcessedEvent{},
+		&domain.MixedOrderStockOperation{},
+		&domain.ProductOutboxEvent{},
 	)
 	if err != nil {
 		logger.Error("❌ Lỗi AutoMigrate Product/Category/Brand", "error", err.Error())
@@ -74,6 +76,7 @@ func main() {
 	productService := service.NewProductService(productRepo, importRedis, kafkaViewProducer, esClient)
 	stockAllocRepo := repository.NewStockAllocationRepository(srv.DB)
 	processedEventRepo := repository.NewProcessedEventRepository(srv.DB)
+	productOutboxRepo := repository.NewProductOutboxRepository(srv.DB)
 
 	// 7. Khởi chạy các Kafka Consumer Workers
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,12 +89,9 @@ func main() {
 		defer viewWorker.Close()
 	}
 
-	// 7.2. Kafka Stock Consumer Worker (Saga Choreography: lắng nghe order.events và tự trừ kho trong ecom_product_db)
-	stockWorker := worker.NewProductStockWorker(kafkaBrokers, productRepo, importRedis, orderKafkaProducer)
-	if stockWorker != nil {
-		stockWorker.Start(ctx)
-		defer stockWorker.Close()
-	}
+	// order.created chỉ là notification. Tồn kho của đơn thường và đơn hỗn hợp
+	// đều do MixedOrderStockWorker xử lý qua operation ledger + Product outbox.
+	// Không chạy legacy ProductStockWorker vì nó có thể trừ lặp khi Kafka redeliver.
 
 	// 7.3. Kafka Flash Sale Confirmation Consumer (Cập nhật sold_quantity trên sổ cái phân bổ)
 	fsConfConsumer := worker.NewFlashSaleConfirmationConsumer(kafkaBrokers, srv.DB, stockAllocRepo, processedEventRepo, orderKafkaProducer)
@@ -99,6 +99,17 @@ func main() {
 		fsConfConsumer.Start(ctx)
 		defer fsConfConsumer.Close()
 	}
+
+	// 7.4. Kafka Mixed Order Stock Worker (Trừ kho thường cho đơn hỗn hợp)
+	mixedStockWorker := worker.NewMixedOrderStockWorker(kafkaBrokers, srv.DB, productRepo, processedEventRepo, importRedis, orderKafkaProducer)
+	if mixedStockWorker != nil {
+		mixedStockWorker.Start(ctx)
+		defer mixedStockWorker.Close()
+	}
+
+	// 7.5. Kafka Product Outbox Publisher Worker (Đảm bảo At-Least-Once delivery cho kết quả kho)
+	productOutboxWorker := worker.NewProductOutboxPublisherWorker(productOutboxRepo, orderKafkaProducer, "product-outbox-worker-1")
+	productOutboxWorker.Start(ctx)
 
 	// 8. Đăng ký Product REST Routes
 	rh := &server.RestHandler{

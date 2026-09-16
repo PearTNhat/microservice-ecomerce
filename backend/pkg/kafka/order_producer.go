@@ -17,6 +17,10 @@ type OrderKafkaProducer interface {
 	PublishOrderCancelled(ctx context.Context, orderID uint, reason string) error
 	PublishFlashSaleOrderTask(ctx context.Context, payload FlashSaleOrderTaskPayload) error
 	PublishStockResult(ctx context.Context, payload StockResultPayload) error
+	PublishMixedOrderStockRequest(ctx context.Context, payload MixedOrderStockRequestPayload) error
+	PublishMixedOrderStockResult(ctx context.Context, payload MixedOrderStockResultPayload) error
+	PublishMixedOrderStockCompensate(ctx context.Context, payload MixedOrderStockCompensatePayload) error
+	PublishMixedOrderStockCompensateResult(ctx context.Context, payload MixedOrderStockCompensateResultPayload) error
 	PublishDeadLetter(ctx context.Context, originalTopic string, key string, rawPayload []byte, errReason string, traceID string) error
 	PublishRaw(ctx context.Context, topic string, key string, payload []byte) error
 	Close() error
@@ -47,10 +51,15 @@ func NewOrderKafkaProducer(brokers []string) OrderKafkaProducer {
 	}
 
 	writers := map[string]*kafka.Writer{
-		TopicOrderEvents:     createWriter(TopicOrderEvents),
-		TopicStockEvents:     createWriter(TopicStockEvents),
-		TopicFlashSaleOrders: createWriter(TopicFlashSaleOrders),
-		TopicOrdersDLT:       createWriter(TopicOrdersDLT),
+		TopicOrderEvents:               createWriter(TopicOrderEvents),
+		TopicStockEvents:               createWriter(TopicStockEvents),
+		TopicFlashSaleOrders:           createWriter(TopicFlashSaleOrders),
+		TopicFlashSaleConfirmed:        createWriter(TopicFlashSaleConfirmed),
+		TopicMixedOrderStockRequest:    createWriter(TopicMixedOrderStockRequest),
+		TopicMixedOrderStockResult:     createWriter(TopicMixedOrderStockResult),
+		TopicMixedOrderStockCompensate:       createWriter(TopicMixedOrderStockCompensate),
+		TopicMixedOrderStockCompensateResult: createWriter(TopicMixedOrderStockCompensateResult),
+		TopicOrdersDLT:                       createWriter(TopicOrdersDLT),
 	}
 
 	logger.Info("✅ [KAFKA] Đã khởi tạo Order Kafka Producer", "brokers", brokers)
@@ -242,6 +251,66 @@ func (p *orderKafkaProducer) PublishStockResult(ctx context.Context, payload Sto
 	return nil
 }
 
+func (p *orderKafkaProducer) PublishMixedOrderStockRequest(ctx context.Context, payload MixedOrderStockRequestPayload) error {
+	payload.EventType = EventMixedStockDeductRequest
+	if payload.Timestamp.IsZero() {
+		payload.Timestamp = time.Now()
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("lỗi serialize MixedOrderStockRequestPayload: %w", err)
+	}
+
+	key := fmt.Sprintf("mixed-req-%d", payload.OrderID)
+	return p.PublishRaw(ctx, TopicMixedOrderStockRequest, key, data)
+}
+
+func (p *orderKafkaProducer) PublishMixedOrderStockResult(ctx context.Context, payload MixedOrderStockResultPayload) error {
+	payload.EventType = EventMixedStockDeductResult
+	if payload.Timestamp.IsZero() {
+		payload.Timestamp = time.Now()
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("lỗi serialize MixedOrderStockResultPayload: %w", err)
+	}
+
+	key := fmt.Sprintf("mixed-res-%d", payload.OrderID)
+	return p.PublishRaw(ctx, TopicMixedOrderStockResult, key, data)
+}
+
+func (p *orderKafkaProducer) PublishMixedOrderStockCompensate(ctx context.Context, payload MixedOrderStockCompensatePayload) error {
+	payload.EventType = EventMixedStockCompensate
+	if payload.Timestamp.IsZero() {
+		payload.Timestamp = time.Now()
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("lỗi serialize MixedOrderStockCompensatePayload: %w", err)
+	}
+
+	key := fmt.Sprintf("mixed-comp-%d", payload.OrderID)
+	return p.PublishRaw(ctx, TopicMixedOrderStockCompensate, key, data)
+}
+
+func (p *orderKafkaProducer) PublishMixedOrderStockCompensateResult(ctx context.Context, payload MixedOrderStockCompensateResultPayload) error {
+	payload.EventType = EventMixedStockCompensateResult
+	if payload.Timestamp.IsZero() {
+		payload.Timestamp = time.Now()
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("lỗi serialize MixedOrderStockCompensateResultPayload: %w", err)
+	}
+
+	key := fmt.Sprintf("mixed-comp-res-%d", payload.OrderID)
+	return p.PublishRaw(ctx, TopicMixedOrderStockCompensateResult, key, data)
+}
+
 func (p *orderKafkaProducer) PublishDeadLetter(ctx context.Context, originalTopic string, key string, rawPayload []byte, errReason string, traceID string) error {
 	w, ok := p.writers[TopicOrdersDLT]
 	if !ok {
@@ -324,6 +393,18 @@ func (n *noopOrderKafkaProducer) PublishFlashSaleOrderTask(ctx context.Context, 
 	return nil
 }
 func (n *noopOrderKafkaProducer) PublishStockResult(ctx context.Context, payload StockResultPayload) error {
+	return nil
+}
+func (n *noopOrderKafkaProducer) PublishMixedOrderStockRequest(ctx context.Context, payload MixedOrderStockRequestPayload) error {
+	return nil
+}
+func (n *noopOrderKafkaProducer) PublishMixedOrderStockResult(ctx context.Context, payload MixedOrderStockResultPayload) error {
+	return nil
+}
+func (n *noopOrderKafkaProducer) PublishMixedOrderStockCompensate(ctx context.Context, payload MixedOrderStockCompensatePayload) error {
+	return nil
+}
+func (n *noopOrderKafkaProducer) PublishMixedOrderStockCompensateResult(ctx context.Context, payload MixedOrderStockCompensateResultPayload) error {
 	return nil
 }
 func (n *noopOrderKafkaProducer) PublishDeadLetter(ctx context.Context, originalTopic string, key string, rawPayload []byte, errReason string, traceID string) error {

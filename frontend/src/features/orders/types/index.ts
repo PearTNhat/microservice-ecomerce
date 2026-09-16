@@ -4,7 +4,8 @@ export type OrderStatus =
   | "PROCESSING"
   | "SHIPPING"
   | "COMPLETED"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "COMPENSATING";
 
 export type PaymentStatus = "PENDING" | "PAID" | "FAILED" | "REFUNDED";
 
@@ -51,6 +52,7 @@ export interface CreateOrderPayload {
   note?: string;
   payment_method: PaymentMethod;
   from_cart?: boolean;
+  quote_token?: string;
   items?: CreateOrderItemPayload[];
 }
 
@@ -88,3 +90,50 @@ export interface FlashSaleStatusResponse {
   reason?: string;
   updated_at?: string;
 }
+
+export interface BasketQuoteItem {
+  product_id: number;
+  quantity: number;
+}
+
+export interface BasketQuoteRequest {
+  items?: BasketQuoteItem[];
+  from_cart?: boolean;
+}
+
+export interface QuoteLineDTO {
+  product_id: number;
+  product_name: string;
+  quantity: number;
+  unit_price: number;
+  subtotal: number;
+  is_flash_sale: boolean;
+  campaign_id?: number;
+  purchase_mode: "FLASH_SALE" | "REGULAR";
+}
+
+export interface BasketQuoteResponse {
+  quote_token: string;
+  total: number;
+  expires_at: number;
+  items: QuoteLineDTO[];
+}
+
+export interface PriceConflictItem {
+  product_id: number;
+  product_name: string;
+  was_flash_sale: boolean;
+  quoted_price: number;
+  updated_price: number;
+  reason: string;
+}
+
+export interface PriceConflictResponse {
+  error_code: string;
+  message: string;
+  new_quote_token: string;
+  new_total: number;
+  affected_items: PriceConflictItem[];
+  new_items?: QuoteLineDTO[];
+}
+

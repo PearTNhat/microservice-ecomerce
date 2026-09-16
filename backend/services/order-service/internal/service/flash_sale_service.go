@@ -31,6 +31,9 @@ type FlashSaleService interface {
 	ListCampaigns(ctx context.Context, status string, page, limit int) ([]*dto.FlashSaleCampaignResponse, int64, error)
 	GetActiveCampaign(ctx context.Context) (*dto.ActiveCampaignResponse, error)
 
+	GetProductOffer(ctx context.Context, productID uint, userID string) (*dto.ProductOfferResponse, error)
+	GetBatchProductOffers(ctx context.Context, productIDs []uint, userID string) (*dto.BatchOfferResponse, error)
+
 	ReserveOrder(ctx context.Context, campaignID, productID uint, userID, requestID string, req *dto.FlashSaleCustomerOrderRequest) (*dto.FlashSaleOrderResponse, error)
 	GetOrderStatus(ctx context.Context, reservationID string, userID string, isAdmin bool) (*dto.FlashSaleOrderStatusResponse, error)
 }
@@ -254,9 +257,17 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 		}
 	}
 
-	// 3. SETTLEMENT BARRIER (Hàng rào quyết toán tồn kho):
-	// Đối với từng item, kiểm tra Product DB sold_quantity đã bắt kịp Order DB sold_stock chưa.
-	// Nếu Product consumer còn đang lag phía sau, không được phép release vội vì sẽ tính to_release sai!
+	// 2.1. DRAIN BARRIER (Point 9 fix): Không được release khi còn đơn hàng/suất giữ chỗ chưa giải quyết (reserved_stock > 0)
+	for _, item := range camp.Items {
+		if item.ReservedStock > 0 {
+			return fmt.Errorf("chưa thể kết thúc campaign: sản phẩm #%d còn %d suất đang giữ chỗ (reserved_stock > 0). Vui lòng đợi các đơn hàng hỗn hợp hoàn tất hoặc hết hạn giữ chỗ",
+				item.ProductID, item.ReservedStock)
+		}
+	}
+
+	// 3. SETTLEMENT BARRIER (Hàng rào quyết toán tồn kho - Point 9 fix):
+	// Đối với từng item, kiểm tra Product DB sold_quantity đã khớp chính xác với Order DB sold_stock chưa (==).
+	// Nếu Product consumer còn đang lag phía sau (<), chờ retry. Nếu lớn hơn (>), báo lỗi bất thường sổ cái.
 	for _, item := range camp.Items {
 		settled := false
 		var lastProductSold int
@@ -264,9 +275,13 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 			alloc, err := s.productClient.GetStockAllocation(ctx, campaignID, item.ProductID)
 			if err == nil && alloc != nil {
 				lastProductSold = alloc.SoldQuantity
-				if alloc.SoldQuantity >= item.SoldStock {
+				if alloc.SoldQuantity == item.SoldStock {
 					settled = true
 					break
+				}
+				if alloc.SoldQuantity > item.SoldStock {
+					return fmt.Errorf("phát hiện bất thường dữ liệu sổ cái (Ledger Discrepancy): Product DB sold=%d vượt quá Order DB sold=%d cho sản phẩm #%d. Campaign được giữ ở trạng thái ENDING để rà soát",
+						alloc.SoldQuantity, item.SoldStock, item.ProductID)
 				}
 			}
 			logger.WarnContext(ctx, "⏳ [SETTLEMENT BARRIER] Chờ Product DB tiêu thụ xong sự kiện bán hàng",
@@ -680,4 +695,142 @@ func (s *flashSaleService) toItemResponse(item *domain.FlashSaleItem) *dto.Flash
 		CreatedAt:           item.CreatedAt,
 		UpdatedAt:           item.UpdatedAt,
 	}
+}
+
+func (s *flashSaleService) GetProductOffer(ctx context.Context, productID uint, userID string) (*dto.ProductOfferResponse, error) {
+	batchResp, err := s.GetBatchProductOffers(ctx, []uint{productID}, userID)
+	if err != nil {
+		return nil, err
+	}
+	if offer, ok := batchResp.Offers[productID]; ok {
+		return offer, nil
+	}
+	return &dto.ProductOfferResponse{
+		ProductID:    productID,
+		PurchaseMode: "REGULAR",
+	}, nil
+}
+
+func (s *flashSaleService) GetBatchProductOffers(ctx context.Context, productIDs []uint, userID string) (*dto.BatchOfferResponse, error) {
+	resp := &dto.BatchOfferResponse{
+		Offers: make(map[uint]*dto.ProductOfferResponse),
+	}
+	if len(productIDs) == 0 {
+		return resp, nil
+	}
+	// Giới hạn tối đa 100 IDs mỗi request để bảo vệ backend
+	if len(productIDs) > 100 {
+		productIDs = productIDs[:100]
+	}
+
+	// 1. Lấy Active Campaign (có preload items)
+	camp, err := s.repo.GetActiveCampaign()
+	if err != nil {
+		logger.WarnContext(ctx, "Lỗi lấy active campaign khi tra cứu offer", "error", err.Error())
+	}
+
+	type activeItemInfo struct {
+		item *domain.FlashSaleItem
+		camp *domain.FlashSaleCampaign
+	}
+	activeMap := make(map[uint]activeItemInfo)
+	now := time.Now()
+	if camp != nil && camp.Status == domain.CampaignStatusActive && camp.StartsAt.Before(now) && camp.EndsAt.After(now) {
+		for i := range camp.Items {
+			it := &camp.Items[i]
+			activeMap[it.ProductID] = activeItemInfo{item: it, camp: camp}
+		}
+	}
+
+	for _, pid := range productIDs {
+		info, isActive := activeMap[pid]
+		if !isActive {
+			resp.Offers[pid] = &dto.ProductOfferResponse{
+				ProductID:    pid,
+				PurchaseMode: "REGULAR",
+				HasFlashSale: false,
+			}
+			continue
+		}
+
+		it := info.item
+		c := info.camp
+
+		// Đọc tồn kho thực tế từ RAM Redis nếu có
+		remaining := it.AllocatedStock - it.SoldStock - it.ReservedStock
+		if s.redisClient != nil {
+			stockKey := redislock.KeyStock(c.ID, pid)
+			if stockVal, err := s.redisClient.Get(ctx, stockKey).Int(); err == nil {
+				remaining = stockVal
+			}
+		}
+
+		if remaining <= 0 {
+			resp.Offers[pid] = &dto.ProductOfferResponse{
+				ProductID:        pid,
+				PurchaseMode:     "REGULAR",
+				HasFlashSale:     false,
+				EffectivePrice:   it.OriginalPrice,
+				RegularPrice:     it.OriginalPrice,
+				OriginalPrice:    it.OriginalPrice,
+				RemainingStock:   0,
+				RemainingDisplay: 0,
+			}
+			continue
+		}
+
+		// Kiểm tra hạn mức người dùng (User Quota)
+		isEligible := true
+		if userID != "" && it.MaxQuantityPerUser > 0 && s.redisClient != nil {
+			resvKey := fmt.Sprintf("fs:{c:%d:p:%d}:user:%s:resv", c.ID, pid, userID)
+			purchasedKey := fmt.Sprintf("fs:{c:%d:p:%d}:user:%s:purchased", c.ID, pid, userID)
+			resvQty, _ := s.redisClient.Get(ctx, resvKey).Int()
+			purchasedQty, _ := s.redisClient.Get(ctx, purchasedKey).Int()
+			if resvQty+purchasedQty >= it.MaxQuantityPerUser {
+				isEligible = false
+			}
+		}
+
+		if !isEligible {
+			resp.Offers[pid] = &dto.ProductOfferResponse{
+				ProductID:          pid,
+				PurchaseMode:       "REGULAR",
+				HasFlashSale:       false,
+				EffectivePrice:     it.OriginalPrice,
+				RegularPrice:       it.OriginalPrice,
+				OriginalPrice:      it.OriginalPrice,
+				RemainingStock:     remaining,
+				RemainingDisplay:   remaining,
+				MaxQuantityPerUser: it.MaxQuantityPerUser,
+			}
+			continue
+		}
+
+		discountPercent := 0
+		if it.OriginalPrice > 0 && it.SalePrice < it.OriginalPrice {
+			discountPercent = int(((it.OriginalPrice - it.SalePrice) / it.OriginalPrice) * 100)
+		}
+
+		salePrice := it.SalePrice
+		endsAt := c.EndsAt
+		campID := c.ID
+		resp.Offers[pid] = &dto.ProductOfferResponse{
+			ProductID:          pid,
+			PurchaseMode:       "FLASH_SALE",
+			HasFlashSale:       true,
+			EffectivePrice:     it.SalePrice,
+			RegularPrice:       it.OriginalPrice,
+			OriginalPrice:      it.OriginalPrice,
+			CampaignID:         &campID,
+			CampaignName:       c.Name,
+			SalePrice:          &salePrice,
+			DiscountPercent:    discountPercent,
+			RemainingStock:     remaining,
+			RemainingDisplay:   remaining,
+			MaxQuantityPerUser: it.MaxQuantityPerUser,
+			EndsAt:             &endsAt,
+		}
+	}
+
+	return resp, nil
 }

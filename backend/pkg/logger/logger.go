@@ -243,3 +243,13 @@ func Debug(msg string, args ...any) {
 func DebugContext(ctx context.Context, msg string, args ...any) {
 	getLogger().DebugContext(ctx, msg, args...)
 }
+
+func Fatal(msg string, args ...any) {
+	getLogger().Error(msg, args...)
+	os.Exit(1)
+}
+
+func FatalContext(ctx context.Context, msg string, args ...any) {
+	getLogger().ErrorContext(ctx, msg, args...)
+	os.Exit(1)
+}

@@ -43,3 +43,38 @@ func (r *processedEventRepository) InsertIfNew(tx *gorm.DB, consumerName, eventI
 
 	return true, nil
 }
+
+func (r *processedEventRepository) GetEvent(tx *gorm.DB, consumerName, eventID string) (*domain.ProcessedEvent, error) {
+	if tx == nil {
+		tx = r.db
+	}
+
+	var event domain.ProcessedEvent
+	err := tx.Where("consumer_name = ? AND event_id = ?", consumerName, eventID).First(&event).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &event, nil
+}
+
+func (r *processedEventRepository) SaveEvent(tx *gorm.DB, consumerName, eventID, status, resultPayload string) error {
+	if tx == nil {
+		tx = r.db
+	}
+
+	processed := domain.ProcessedEvent{
+		ConsumerName:  consumerName,
+		EventID:       eventID,
+		Status:        status,
+		ResultPayload: resultPayload,
+		ProcessedAt:   time.Now(),
+	}
+
+	return tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "consumer_name"}, {Name: "event_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"status", "result_payload", "processed_at"}),
+	}).Create(&processed).Error
+}

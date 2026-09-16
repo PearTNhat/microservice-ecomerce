@@ -15,6 +15,7 @@ import (
 	"os"
 
 	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -35,6 +36,12 @@ func main() {
 
 	// 1. Khởi tạo Structured Logger
 	logger.InitLogger("order-service", appConfig.Environment, appConfig.GraylogAddress)
+
+	// 19.3 (P0): Chặn đứng khởi động Order Service nếu QUOTE_SECRET chưa được cấu hình hoặc < 16 bytes
+	if len(appConfig.QuoteSecret) < 16 {
+		logger.Fatal("CRITICAL_SECURITY_ERROR: QUOTE_SECRET (hoặc APP_SECRET) chưa được cấu hình hoặc ngắn hơn 16 ký tự. Order Service từ chối khởi động để bảo vệ an ninh giỏ hàng!")
+	}
+
 	logger.Info("🛒 Khởi động Order Microservice (Database-per-Service & Kafka Event-Driven)",
 		"rest_port", restPort,
 		"env", appConfig.Environment,
@@ -83,7 +90,12 @@ func main() {
 	processedEventRepo := repository.NewProcessedEventRepository(srv.DB)
 
 	cartService := service.NewCartService(cartRepo, productClient)
-	orderService := service.NewOrderService(orderRepo, cartRepo, productClient, importRedis, orderKafkaProducer)
+	orderService := service.NewOrderService(orderRepo, cartRepo, productClient, importRedis, orderKafkaProducer, appConfig.QuoteSecret)
+	if ordSvcImpl, ok := orderService.(interface {
+		SetFlashSale(db *gorm.DB, fsRepo domain.FlashSaleRepository)
+	}); ok {
+		ordSvcImpl.SetFlashSale(srv.DB, fsRepo)
+	}
 	flashSaleService := service.NewFlashSaleService(fsRepo, productClient, importRedis)
 
 	// 7. Khởi chạy các Kafka Consumer & Background Workers
@@ -116,18 +128,21 @@ func main() {
 	reconWorker := worker.NewReconciliationWorker(srv.DB, fsRepo, importRedis)
 	reconWorker.Start(ctx)
 
-	// 7.6. Order Saga Worker (Lắng nghe stock.events từ Product Service để Confirm/Cancel đơn hàng)
-	orderSagaWorker := worker.NewOrderSagaWorker(kafkaBrokers, orderRepo, importRedis, orderKafkaProducer)
-	if orderSagaWorker != nil {
-		orderSagaWorker.Start(ctx)
-		defer orderSagaWorker.Close()
-	}
+	// Không chạy legacy OrderSagaWorker (stock.events): tất cả checkout mới
+	// nhận kết quả qua MixedOrderSagaWorker và Product transactional outbox.
 
 	// 7.7. Flash Sale Projection Worker (Lắng nghe flashsale.confirmed để cập nhật durable Redis projection)
 	fsProjectionWorker := worker.NewFlashSaleProjectionWorker(kafkaBrokers, importRedis, fsRepo)
 	if fsProjectionWorker != nil {
 		fsProjectionWorker.Start(ctx)
 		defer fsProjectionWorker.Close()
+	}
+
+	// 7.8. Mixed Order Saga Worker (Lắng nghe kết quả trừ kho thường cho đơn hỗn hợp)
+	mixedSagaWorker := worker.NewMixedOrderSagaWorker(kafkaBrokers, srv.DB, orderRepo, fsRepo, outboxRepo, importRedis, orderKafkaProducer)
+	if mixedSagaWorker != nil {
+		mixedSagaWorker.Start(ctx)
+		defer mixedSagaWorker.Close()
 	}
 
 	// 8. Đăng ký REST Routes theo từng module

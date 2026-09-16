@@ -38,7 +38,7 @@ func NewProductStockWorker(
 		GroupID:        pkgKafka.ConsumerGroupProductStock,
 		MinBytes:       1,
 		MaxBytes:       10e6,
-		CommitInterval: time.Second,
+		CommitInterval: 0,
 	})
 
 	return &ProductStockWorker{
@@ -78,7 +78,27 @@ func (w *ProductStockWorker) Start(ctx context.Context) {
 				}
 
 				w.processMessage(ctx, m)
-				_ = w.reader.CommitMessages(ctx, m)
+
+				commitBackoff := 500 * time.Millisecond
+				for {
+					if ctx.Err() != nil {
+						return
+					}
+					if commitErr := w.reader.CommitMessages(ctx, m); commitErr != nil {
+						logger.Error("❌ ProductStockWorker lỗi commit offset, retry commit", "error", commitErr.Error())
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(commitBackoff):
+						}
+						commitBackoff *= 2
+						if commitBackoff > 10*time.Second {
+							commitBackoff = 10 * time.Second
+						}
+						continue
+					}
+					break
+				}
 			}
 		}
 	}()
@@ -122,10 +142,14 @@ func (w *ProductStockWorker) processMessage(ctx context.Context, m kafka.Message
 		"items_count", len(payload.Items),
 	)
 
-	if payload.IsFlashSale {
-		logger.InfoContext(reqCtx, "⚡ [FLASH SALE] Bỏ qua trừ tồn kho thường vì đơn hàng đã được phân bổ tồn kho Flash Sale",
+	// Point 8 fix: Hợp đồng phân chia trách nhiệm trừ kho rõ ràng:
+	// - Đơn Flash Sale và Đơn Hỗn hợp (Mixed): Tồn kho thường đã được trừ bởi MixedOrderStockWorker
+	// -> ORDER_CREATED ở đây chỉ mang tính chất thông báo downstream, không trừ kho lần 2!
+	if payload.IsFlashSale || payload.StockHandledBySaga {
+		logger.InfoContext(reqCtx, "⚡ [INVENTORY CONTRACT] Bỏ qua trừ tồn kho cho sự kiện ORDER_CREATED vì tồn kho đã được xử lý bởi Flash Sale / Mixed Saga",
 			"order_id", payload.OrderID,
-			"campaign_id", payload.CampaignID,
+			"is_flash_sale", payload.IsFlashSale,
+			"stock_handled_by_saga", payload.StockHandledBySaga,
 		)
 		return
 	}
@@ -133,8 +157,11 @@ func (w *ProductStockWorker) processMessage(ctx context.Context, m kafka.Message
 	var deductedItems []pkgKafka.OrderItemPayload
 	var deductErr error
 
-	// 1. Trừ tồn kho trong PostgreSQL (Database ecom_product_db)
+	// 1. Trừ tồn kho trong PostgreSQL (Database ecom_product_db) cho đơn hàng thông thường
 	for _, item := range payload.Items {
+		if item.IsFlashSale {
+			continue
+		}
 		err := w.repo.DeductStock(item.ProductID, item.Quantity)
 		if err != nil {
 			deductErr = fmt.Errorf("sản phẩm #%d '%s' không đủ tồn kho: %w", item.ProductID, item.ProductName, err)

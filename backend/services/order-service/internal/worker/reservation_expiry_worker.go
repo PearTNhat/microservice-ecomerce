@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	pkgKafka "ecomerce-service/pkg/kafka"
 	"ecomerce-service/pkg/logger"
 	"ecomerce-service/pkg/redislock"
 	"ecomerce-service/services/order-service/internal/domain"
@@ -67,8 +68,67 @@ func (w *ReservationExpiryWorker) processExpiredBatch(ctx context.Context) {
 	for _, resv := range expiredList {
 		// 1. Giải phóng tồn kho và đổi status trong Database bằng Transaction
 		dbErr := w.db.Transaction(func(tx *gorm.DB) error {
-			return w.fsRepo.ReleaseReservationDB(tx, resv.ID, domain.ReservationStatusExpired)
+			if err := w.fsRepo.ReleaseReservationDB(tx, resv.ID, domain.ReservationStatusExpired); err != nil {
+				return err
+			}
+			// Nếu reservation gắn với đơn hàng đang PENDING -> Tự động hủy đơn và bồi hoàn kho thường nếu có
+			if resv.OrderID != nil {
+				var order domain.Order
+				if err := tx.Preload("Items").Where("id = ? AND order_status = ?", *resv.OrderID, domain.OrderStatusPending).First(&order).Error; err == nil {
+					// Tìm các món hàng thường để bồi hoàn (Point 4 & Section 17.2 fix)
+					var regularItems []pkgKafka.OrderItemPayload
+					for _, item := range order.Items {
+						if !item.IsFlashSale {
+							regularItems = append(regularItems, pkgKafka.OrderItemPayload{
+								ProductID:   item.ProductID,
+								ProductName: item.ProductName,
+								Quantity:    item.Quantity,
+							})
+						}
+					}
+
+					targetStatus := domain.OrderStatusCancelled
+					if len(regularItems) > 0 {
+						targetStatus = domain.OrderStatusCompensating
+					}
+
+					if err := tx.Model(&order).Update("order_status", targetStatus).Error; err != nil {
+						return err
+					}
+
+					if len(regularItems) > 0 {
+						now := time.Now()
+						compPayload := pkgKafka.MixedOrderStockCompensatePayload{
+							EventID:   fmt.Sprintf("comp-expiry-%d-%s", order.ID, resv.ID),
+							EventType: pkgKafka.EventMixedStockCompensate,
+							OrderID:   order.ID,
+							OrderCode: order.OrderCode,
+							Items:     regularItems,
+							Reason:    "Flash Sale reservation expired while order was PENDING",
+							TraceID:   logger.GetTraceID(ctx),
+							Timestamp: now,
+						}
+						compData, _ := json.Marshal(compPayload)
+						outboxComp := &domain.OutboxEvent{
+							ID:            fmt.Sprintf("outbox-comp-exp-%d", order.ID),
+							AggregateType: "order",
+							AggregateID:   fmt.Sprintf("%d", order.ID),
+							EventType:     pkgKafka.EventMixedStockCompensate,
+							Topic:         pkgKafka.TopicMixedOrderStockCompensate,
+							PartitionKey:  fmt.Sprintf("order-%d", order.ID),
+							Payload:       string(compData),
+							Status:        domain.OutboxStatusPending,
+							CreatedAt:     now,
+						}
+						if err := tx.Create(outboxComp).Error; err != nil {
+							return fmt.Errorf("lỗi ghi outbox bồi hoàn kho thường: %w", err)
+						}
+					}
+				}
+			}
+			return nil
 		})
+
 
 		if dbErr != nil {
 			logger.ErrorContext(ctx, "Lỗi release reservation trong DB", "reservation_id", resv.ID, "error", dbErr.Error())

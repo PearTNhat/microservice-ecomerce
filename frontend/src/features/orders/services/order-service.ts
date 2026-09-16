@@ -1,6 +1,8 @@
 import { apiClient } from "@/lib/api-client";
 import { ApiResponse } from "@/types";
 import {
+  BasketQuoteRequest,
+  BasketQuoteResponse,
   CreateOrderPayload,
   FlashSaleAsyncResponse,
   FlashSaleOrderPayload,
@@ -99,6 +101,18 @@ export const orderService = {
   async getOrderByID(orderID: number): Promise<ApiResponse<Order>> {
     return apiClient<ApiResponse<Order>>(`/orders/${orderID}`, {
       method: "GET",
+    });
+  },
+
+  /**
+   * Lấy báo giá chính xác cho giỏ hàng kèm QuoteToken (17.1)
+   */
+  async getBasketQuote(
+    payload: BasketQuoteRequest
+  ): Promise<ApiResponse<BasketQuoteResponse>> {
+    return apiClient<ApiResponse<BasketQuoteResponse>>("/orders/checkout/quote", {
+      method: "POST",
+      body: JSON.stringify(payload),
     });
   },
 };

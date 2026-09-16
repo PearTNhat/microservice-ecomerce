@@ -113,3 +113,29 @@ type StockAllocationResponse struct {
 	ReleasedQuantity  int    `json:"released_quantity"`
 	Status            string `json:"status"`
 }
+
+type ProductOfferResponse struct {
+	ProductID          uint       `json:"product_id"`
+	PurchaseMode       string     `json:"purchase_mode"` // "FLASH_SALE" or "REGULAR"
+	HasFlashSale       bool       `json:"has_flash_sale"`
+	EffectivePrice     float64    `json:"effective_price"`
+	RegularPrice       float64    `json:"regular_price"`
+	OriginalPrice      float64    `json:"original_price"`
+	CampaignID         *uint      `json:"campaign_id,omitempty"`
+	CampaignName       string     `json:"campaign_name,omitempty"`
+	SalePrice          *float64   `json:"sale_price,omitempty"`
+	DiscountPercent    int        `json:"discount_percentage,omitempty"`
+	RemainingStock     int        `json:"remaining_stock,omitempty"`
+	RemainingDisplay   int        `json:"remaining_display,omitempty"`
+	MaxQuantityPerUser int        `json:"max_quantity_per_user,omitempty"`
+	EndsAt             *time.Time `json:"ends_at,omitempty"`
+}
+
+type BatchOfferRequest struct {
+	ProductIDs []uint `json:"product_ids"`
+}
+
+type BatchOfferResponse struct {
+	Offers map[uint]*ProductOfferResponse `json:"offers"`
+}
+

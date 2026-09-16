@@ -4,12 +4,13 @@ import "time"
 
 // Trạng thái đơn hàng
 const (
-	OrderStatusPending    = "PENDING"
-	OrderStatusConfirmed  = "CONFIRMED"
-	OrderStatusProcessing = "PROCESSING"
-	OrderStatusShipped    = "SHIPPED"
-	OrderStatusDelivered  = "DELIVERED"
-	OrderStatusCancelled  = "CANCELLED"
+	OrderStatusPending      = "PENDING"
+	OrderStatusConfirmed    = "CONFIRMED"
+	OrderStatusProcessing   = "PROCESSING"
+	OrderStatusShipped      = "SHIPPED"
+	OrderStatusDelivered    = "DELIVERED"
+	OrderStatusCancelled    = "CANCELLED"
+	OrderStatusCompensating = "COMPENSATING" // 17.2: Trạng thái trung gian chờ Product Service bồi hoàn tồn kho thường
 )
 
 // Roles
@@ -56,18 +57,22 @@ type Order struct {
 
 // OrderItem đại diện cho một sản phẩm trong đơn hàng
 type OrderItem struct {
-	ID          uint      `json:"id" gorm:"primaryKey"`
-	OrderID     uint      `json:"order_id" gorm:"not null;index"`
-	ProductID   uint      `json:"product_id" gorm:"not null;index"`
-	ProductName string    `json:"product_name" gorm:"not null"`
-	ProductSlug string    `json:"product_slug,omitempty"`
-	Thumbnail   string    `json:"thumbnail,omitempty"`
-	Price       float64   `json:"price" gorm:"not null"`
-	Quantity    int       `json:"quantity" gorm:"not null"`
-	Subtotal    float64   `json:"subtotal" gorm:"not null"`
-	CreatedAt   time.Time `json:"created_at" gorm:"default:current_timestamp"`
-	UpdatedAt   time.Time `json:"updated_at" gorm:"default:current_timestamp"`
+	ID            uint      `json:"id" gorm:"primaryKey"`
+	OrderID       uint      `json:"order_id" gorm:"not null;index"`
+	ProductID     uint      `json:"product_id" gorm:"not null;index"`
+	ProductName   string    `json:"product_name" gorm:"not null"`
+	ProductSlug   string    `json:"product_slug,omitempty"`
+	Thumbnail     string    `json:"thumbnail,omitempty"`
+	Price         float64   `json:"price" gorm:"not null"`
+	Quantity      int       `json:"quantity" gorm:"not null"`
+	Subtotal      float64   `json:"subtotal" gorm:"not null"`
+	IsFlashSale   bool      `json:"is_flash_sale" gorm:"default:false"`
+	CampaignID    *uint     `json:"campaign_id,omitempty"`
+	ReservationID string    `json:"reservation_id,omitempty" gorm:"size:64"`
+	CreatedAt     time.Time `json:"created_at" gorm:"default:current_timestamp"`
+	UpdatedAt     time.Time `json:"updated_at" gorm:"default:current_timestamp"`
 }
+
 
 // CanCancel kiểm tra xem đơn hàng có đủ điều kiện hủy không
 func (o *Order) CanCancel() bool {

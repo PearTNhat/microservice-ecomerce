@@ -262,3 +262,73 @@ func TestFlashSaleService_GetActiveCampaign(t *testing.T) {
 	assert.Equal(t, 20, active.Items[0].RemainingStock)
 	assert.Equal(t, 2, active.Items[0].MaxQuantityPerUser)
 }
+
+func TestFlashSaleService_ProductOffers(t *testing.T) {
+	_, mr, rdb := setupFlashSaleTestEnv(t)
+	defer mr.Close()
+	defer rdb.Close()
+
+	dbName := fmt.Sprintf("file:fs_offers_test_%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	assert.NoError(t, err)
+	_ = db.AutoMigrate(&domain.FlashSaleCampaign{}, &domain.FlashSaleItem{}, &domain.FlashSaleReservation{})
+
+	fsRepo := repository.NewFlashSaleRepository(db)
+	prodClient := &mockProductClientForFlashSale{allocated: make(map[uint]int)}
+	svc := NewFlashSaleService(fsRepo, prodClient, rdb)
+	ctx := context.Background()
+
+	// 1. Kiểm tra sản phẩm khi chưa có chiến dịch nào
+	offer, err := svc.GetProductOffer(ctx, 101, "user-1")
+	assert.NoError(t, err)
+	assert.NotNil(t, offer)
+	assert.False(t, offer.HasFlashSale)
+
+	// 2. Tạo & kích hoạt chiến dịch
+	now := time.Now()
+	camp, err := svc.CreateCampaign(ctx, &dto.CreateCampaignRequest{
+		Name:        "Holiday Sale",
+		Description: "Holiday Sale Desc",
+		StartsAt:    now.Add(-5 * time.Minute),
+		EndsAt:      now.Add(2 * time.Hour),
+	})
+	assert.NoError(t, err)
+
+	_, err = svc.AddItem(ctx, camp.ID, &dto.AddFlashSaleItemRequest{
+		ProductID:           101,
+		SalePrice:           400000,
+		OriginalPrice:       1000000,
+		AllocatedStock:      10,
+		MaxQuantityPerUser:  2,
+		MaxQuantityPerOrder: 1,
+		ReservationSeconds:  120,
+	})
+	assert.NoError(t, err)
+
+	err = svc.ActivateCampaign(ctx, camp.ID)
+	assert.NoError(t, err)
+
+	// 3. Lấy ưu đãi đơn lẻ cho sản phẩm 101
+	offer, err = svc.GetProductOffer(ctx, 101, "user-1")
+	assert.NoError(t, err)
+	assert.NotNil(t, offer)
+	assert.True(t, offer.HasFlashSale)
+	assert.Equal(t, float64(400000), *offer.SalePrice)
+	assert.Equal(t, float64(400000), offer.EffectivePrice)
+	assert.Equal(t, float64(1000000), offer.OriginalPrice)
+	assert.Equal(t, 60, offer.DiscountPercent)
+	assert.Equal(t, 10, offer.RemainingStock)
+	assert.Equal(t, 2, offer.MaxQuantityPerUser)
+
+	// 4. Lấy ưu đãi hàng loạt (Batch offers)
+	batchResp, err := svc.GetBatchProductOffers(ctx, []uint{101, 999}, "user-1")
+	assert.NoError(t, err)
+	assert.NotNil(t, batchResp)
+	assert.Len(t, batchResp.Offers, 2)
+
+	assert.True(t, batchResp.Offers[101].HasFlashSale)
+	assert.Equal(t, float64(400000), *batchResp.Offers[101].SalePrice)
+
+	assert.False(t, batchResp.Offers[999].HasFlashSale)
+}
+

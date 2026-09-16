@@ -55,6 +55,8 @@ backend/
 
 Hệ thống tuân thủ nghiêm ngặt nguyên tắc **Database-per-Service** (Zero Shared Database). Quá trình đặt hàng và trừ kho được điều phối bất đồng bộ qua **Apache Kafka**:
 
+Checkout hiện tại (đơn chỉ có hàng thường hoặc giỏ hỗn hợp) tạo order `PENDING` và `mixed.stock.request` trong **cùng Order DB transaction**. Product Service trừ kho thường và ghi `mixed.stock.result` vào Product DB outbox trong cùng transaction; Order Service xác nhận/hủy sau khi nhận result. `order.created` chỉ được phát sau khi xác nhận và **không** kích hoạt trừ kho lần hai. Hai consumer cũ dùng `order.created → stock.events` không còn được khởi chạy. Nếu nâng cấp từ một bản đã có order `PENDING` theo luồng cũ, cần xử lý/migrate backlog đó trước khi triển khai bản mới; không tự ý reset Kafka offset.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -67,22 +69,20 @@ sequenceDiagram
 
     Client->>Gateway: POST /api/v1/orders/direct (kèm Idempotency-Key)
     Gateway->>OrderSvc: Proxy request (đã xác thực JWT & Trace-ID)
-    Note over OrderSvc: Tạo đơn hàng PENDING trong ecom_order_db
-    OrderSvc->>Kafka: Publish topic: "order.events" [ORDER_CREATED]
+    Note over OrderSvc: Transaction: order PENDING + stock-request outbox
+    OrderSvc->>Kafka: Outbox publish mixed.stock.request
     OrderSvc-->>Client: HTTP 201 Created (Order PENDING)
 
-    par Product Consumer Group
-        Kafka->>ProductSvc: Consume ORDER_CREATED
-        Note over ProductSvc: Trừ tồn kho trong ecom_product_db (Atomic SQL)
-        alt Trừ kho thành công
-            ProductSvc->>Kafka: Publish topic "stock.events" [STOCK_DEDUCTED_SUCCESS]
-            Kafka->>OrderSvc: Saga Worker cập nhật đơn -> CONFIRMED
-        else Hết hàng / Lỗi
-            ProductSvc->>Kafka: Publish topic "stock.events" [STOCK_DEDUCTED_FAILED]
-            Kafka->>OrderSvc: Saga Worker hoàn tác (Compensate) đơn -> CANCELLED
-        end
-    and Email Consumer Group
-        Kafka->>EmailWorker: Consume ORDER_CREATED -> Gửi email hóa đơn ngầm
+    Kafka->>ProductSvc: Consume mixed.stock.request
+    Note over ProductSvc: Transaction: stock operation + product outbox
+    ProductSvc->>Kafka: Outbox publish mixed.stock.result
+    Kafka->>OrderSvc: Mixed Saga Worker xử lý result
+    alt Trừ kho thành công
+        Note over OrderSvc: CONFIRMED + order.created outbox
+        OrderSvc->>Kafka: Publish order.created (notification)
+        Kafka->>EmailWorker: Gửi email hóa đơn
+    else Hết hàng
+        Note over OrderSvc: COMPENSATING -> chờ compensation result -> CANCELLED
     end
 ```
 

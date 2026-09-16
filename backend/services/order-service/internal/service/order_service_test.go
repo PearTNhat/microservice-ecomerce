@@ -8,6 +8,7 @@ import (
 	"ecomerce-service/services/order-service/internal/dto"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -142,6 +143,14 @@ func (m *mockOrderRepositoryForOrderService) UpdatePaymentStatus(orderID uint, s
 	return nil
 }
 
+func helperQuoteToken(t *testing.T, userID string, items []QuoteItem, total float64) string {
+	tok, err := GenerateQuoteToken([]byte(testQuoteSecret), userID, items, total, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateQuoteToken failed: %v", err)
+	}
+	return tok
+}
+
 func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -155,7 +164,7 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 	orderRepo := newMockOrderRepositoryForOrderService()
 	producer := kafka.NewNoopOrderKafkaProducer()
 
-	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer)
+	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer, testQuoteSecret)
 	ctx := context.Background()
 	userID := "user-abc"
 
@@ -168,6 +177,9 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 		CustomerPhone:   "0987654321",
 		ShippingAddress: "123 Đường Công Nghệ, TP.HCM",
 		PaymentMethod:   "COD",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 100, Quantity: 2, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+		}, 0),
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 100, Quantity: 2},
@@ -189,6 +201,9 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 		CustomerPhone:   "0987654321",
 		ShippingAddress: "Kho Tổng",
 		PaymentMethod:   "COD",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 100, Quantity: 999, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+		}, 0),
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 100, Quantity: 999},
@@ -214,6 +229,9 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 		CustomerPhone:   "0987654321",
 		ShippingAddress: "123 Đường Công Nghệ, TP.HCM",
 		PaymentMethod:   "VNPAY",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 200, Quantity: 3, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+		}, 0),
 		FromCart:        true,
 	}
 
@@ -237,7 +255,7 @@ func TestOrderService_GetOrderAndStatus(t *testing.T) {
 	orderRepo := newMockOrderRepositoryForOrderService()
 	producer := kafka.NewNoopOrderKafkaProducer()
 
-	svc := NewOrderService(orderRepo, cartRepo, nil, nil, producer)
+	svc := NewOrderService(orderRepo, cartRepo, nil, nil, producer, testQuoteSecret)
 	ctx := context.Background()
 	userID := "user-xyz"
 
@@ -248,6 +266,9 @@ func TestOrderService_GetOrderAndStatus(t *testing.T) {
 		CustomerPhone:   "0123456789",
 		ShippingAddress: "Địa chỉ nhận",
 		PaymentMethod:   "COD",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 1, Quantity: 1, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+		}, 0),
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 1, Quantity: 1},
@@ -326,7 +347,7 @@ func TestOrderService_MultiItemRollback_WhenOneItemFails(t *testing.T) {
 	orderRepo := newMockOrderRepositoryForOrderService()
 	producer := kafka.NewNoopOrderKafkaProducer()
 
-	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer)
+	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer, testQuoteSecret)
 	ctx := context.Background()
 	userID := "user-rollback-test"
 
@@ -342,6 +363,10 @@ func TestOrderService_MultiItemRollback_WhenOneItemFails(t *testing.T) {
 		CustomerPhone:   "0123456789",
 		ShippingAddress: "Địa chỉ nhận hàng",
 		PaymentMethod:   "COD",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 1, Quantity: 2, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+			{ProductID: 2, Quantity: 1, QuotedPrice: 0, PurchaseMode: "REGULAR"},
+		}, 0),
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 1, Quantity: 2},
@@ -386,7 +411,7 @@ func TestOrderService_LazyLoadingStock_FromDB(t *testing.T) {
 		Stock: 25,
 	}
 
-	svc := NewOrderService(orderRepo, cartRepo, prodClient, rdb, producer)
+	svc := NewOrderService(orderRepo, cartRepo, prodClient, rdb, producer, testQuoteSecret)
 	ctx := context.Background()
 	userID := "user-lazy-test"
 
@@ -396,6 +421,9 @@ func TestOrderService_LazyLoadingStock_FromDB(t *testing.T) {
 		CustomerPhone:   "0123456789",
 		ShippingAddress: "Địa chỉ giao hàng",
 		PaymentMethod:   "COD",
+		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
+			{ProductID: 300, Quantity: 3, QuotedPrice: 15000000, PurchaseMode: "REGULAR"},
+		}, 45000000),
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 300, Quantity: 3},

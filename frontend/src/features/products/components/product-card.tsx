@@ -3,23 +3,71 @@
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useCartStore } from "@/features/cart/store/useCartStore";
+import { flashSaleService } from "@/features/flash-sale/services/flash-sale-service";
+import { ProductOfferResponse } from "@/features/flash-sale/types";
 import { calculateDiscount, formatPrice } from "@/lib/utils";
 import { Eye, ShoppingBag, Star, Zap } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { Product } from "../types";
 
 interface ProductCardProps {
   product: Product;
+  initialOffer?: ProductOfferResponse;
 }
 
-export function ProductCard({ product }: ProductCardProps) {
+export function ProductCard({ product, initialOffer }: ProductCardProps) {
   const { addItem } = useCartStore();
-  const discountPercent = calculateDiscount(product.price, product.discount_price);
-  const currentPrice = product.discount_price || product.price;
+  const [offer, setOffer] = useState<ProductOfferResponse | null>(initialOffer || null);
+
+  useEffect(() => {
+    if (initialOffer !== undefined) return;
+    let cancelled = false;
+    flashSaleService
+      .getProductOffer(product.id)
+      .then((res) => {
+        if (!cancelled && res.data && res.data.has_flash_sale) {
+          setOffer(res.data);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [product.id, initialOffer]);
+
+  const hasFlashSale = !!(offer && offer.has_flash_sale);
+  const currentPrice = hasFlashSale
+    ? offer.sale_price
+    : product.discount_price || product.price;
+
+  const originalPrice = product.price;
+  const discountPercent = hasFlashSale && offer.discount_percentage
+    ? offer.discount_percentage
+    : calculateDiscount(product.price, product.discount_price);
+
+  const handleAddToCart = () => {
+    if (hasFlashSale) {
+      addItem(product, 1, {
+        isFlashSale: true,
+        campaignId: offer.campaign_id,
+        salePrice: offer.sale_price,
+        maxPerUser: offer.max_quantity_per_user,
+      });
+    } else {
+      addItem(product, 1);
+    }
+  };
 
   return (
-    <div className="group relative flex flex-col bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 overflow-hidden shadow-sm hover:shadow-xl hover:border-blue-500/30 transition-all duration-300">
+    <div
+      className={`group relative flex flex-col bg-white dark:bg-slate-900 rounded-2xl border overflow-hidden shadow-sm hover:shadow-xl transition-all duration-300 ${
+        hasFlashSale
+          ? "border-rose-300/80 dark:border-rose-800/80 hover:border-rose-500 shadow-rose-500/10"
+          : "border-slate-100 dark:border-slate-800 hover:border-blue-500/30"
+      }`}
+    >
       {/* Thumbnail & Badges */}
       <Link
         href={`/products/${product.id}`}
@@ -41,10 +89,17 @@ export function ProductCard({ product }: ProductCardProps) {
 
         {/* Badges */}
         <div className="absolute top-2.5 left-2.5 flex flex-col gap-1 z-10">
-          {discountPercent > 0 && (
-            <Badge variant="danger" className="font-bold shadow-sm">
-              -{discountPercent}%
-            </Badge>
+          {hasFlashSale ? (
+            <div className="inline-flex items-center gap-1 bg-gradient-to-r from-red-600 to-rose-600 text-white font-black text-xs px-2 py-0.5 rounded-lg shadow-md animate-pulse">
+              <Zap className="w-3 h-3 fill-current" />
+              <span>FLASH SALE -{discountPercent}%</span>
+            </div>
+          ) : (
+            discountPercent > 0 && (
+              <Badge variant="danger" className="font-bold shadow-sm">
+                -{discountPercent}%
+              </Badge>
+            )
           )}
           {product.brand && (
             <Badge variant="default" className="bg-white/90 dark:bg-slate-900/90 shadow-sm backdrop-blur-sm">
@@ -83,37 +138,53 @@ export function ProductCard({ product }: ProductCardProps) {
         <div className="pt-2 border-t border-slate-100 dark:border-slate-800/80">
           <div className="flex items-center justify-between">
             <div className="flex items-baseline gap-2">
-              <span className="text-base font-extrabold text-blue-600 dark:text-blue-400">
+              <span
+                className={`text-base font-extrabold ${
+                  hasFlashSale
+                    ? "text-rose-600 dark:text-rose-400"
+                    : "text-blue-600 dark:text-blue-400"
+                }`}
+              >
                 {formatPrice(currentPrice)}
               </span>
-              {product.discount_price && product.discount_price < product.price && (
+              {originalPrice > currentPrice && (
                 <span className="text-xs text-slate-400 line-through">
-                  {formatPrice(product.price)}
+                  {formatPrice(originalPrice)}
                 </span>
               )}
             </div>
             <span
               className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                product.stock > 5
+                hasFlashSale
+                  ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20 animate-pulse"
+                  : product.stock > 5
                   ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
                   : product.stock > 0
                   ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 animate-pulse"
                   : "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
               }`}
             >
-              {product.stock > 0 ? `Còn ${product.stock}` : "Hết hàng"}
+              {hasFlashSale && offer?.remaining_stock !== undefined
+                ? `Còn ${offer.remaining_stock} suất sale`
+                : product.stock > 0
+                ? `Còn ${product.stock}`
+                : "Hết hàng"}
             </span>
           </div>
 
           <div className="mt-3 flex items-center gap-2">
             <Button
-              onClick={() => addItem(product, 1)}
+              onClick={handleAddToCart}
               variant="primary"
               size="sm"
-              className="flex-1 text-xs"
+              className={`flex-1 text-xs ${
+                hasFlashSale
+                  ? "bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-700 hover:to-rose-700 shadow-rose-600/20"
+                  : ""
+              }`}
             >
               <ShoppingBag className="w-3.5 h-3.5" />
-              Thêm giỏ hàng
+              {hasFlashSale ? "Thêm giá Flash Sale" : "Thêm giỏ hàng"}
             </Button>
             <Link
               href={`/products/${product.id}`}

@@ -13,11 +13,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+const testQuoteSecret = "test-quote-secret-key-for-unit-tests-32b"
 
 type mockOrderRepoForHandlerTest struct {
 	orders []*domain.Order
@@ -71,7 +74,7 @@ func setupTestOrderApp(t *testing.T) (*fiber.App, string, string) {
 	orderRepo := &mockOrderRepoForHandlerTest{}
 	producer := kafka.NewNoopOrderKafkaProducer()
 
-	orderSvc := service.NewOrderService(orderRepo, nil, nil, rdb, producer)
+	orderSvc := service.NewOrderService(orderRepo, nil, nil, rdb, producer, testQuoteSecret)
 
 	app := fiber.New()
 	rh := &server.RestHandler{
@@ -104,12 +107,44 @@ func TestOrderHandler_UnauthorizedWhenNoToken(t *testing.T) {
 func TestOrderHandler_CreateOrder(t *testing.T) {
 	app, token, _ := setupTestOrderApp(t)
 
+	// 1. Kiểm tra khi thiếu quote_token: phải trả về 400 Bad Request
+	orderBodyMissingQuote, _ := json.Marshal(dto.CreateOrderRequest{
+		CustomerName:    "Khách Hàng Mẫu",
+		CustomerEmail:   "test@gmail.com",
+		CustomerPhone:   "0901234567",
+		ShippingAddress: "Hà Nội, Việt Nam",
+		PaymentMethod:   "COD",
+		FromCart:        false,
+		Items: []dto.CreateOrderItemRequest{
+			{ProductID: 1, Quantity: 1},
+		},
+	})
+	reqMissing := httptest.NewRequest("POST", "/orders", bytes.NewReader(orderBodyMissingQuote))
+	reqMissing.Header.Set("Authorization", "Bearer "+token)
+	reqMissing.Header.Set("Content-Type", "application/json")
+	respMissing, err := app.Test(reqMissing)
+	if err != nil {
+		t.Fatalf("Lỗi Create Order missing quote: %v", err)
+	}
+	if respMissing.StatusCode != http.StatusBadRequest {
+		t.Errorf("Kỳ vọng status 400 Bad Request khi thiếu quote_token nhưng nhận %d", respMissing.StatusCode)
+	}
+
+	// 2. Kiểm tra khi có quote_token hợp lệ: trả về 201 Created
+	quoteToken, err := service.GenerateQuoteToken([]byte(testQuoteSecret), "1", []service.QuoteItem{
+		{ProductID: 1, Quantity: 1, QuotedPrice: 100000, PurchaseMode: "REGULAR"},
+	}, 100000, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Lỗi sinh quote token: %v", err)
+	}
+
 	orderBody, _ := json.Marshal(dto.CreateOrderRequest{
 		CustomerName:    "Khách Hàng Mẫu",
 		CustomerEmail:   "test@gmail.com",
 		CustomerPhone:   "0901234567",
 		ShippingAddress: "Hà Nội, Việt Nam",
 		PaymentMethod:   "COD",
+		QuoteToken:      quoteToken,
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 1, Quantity: 1},

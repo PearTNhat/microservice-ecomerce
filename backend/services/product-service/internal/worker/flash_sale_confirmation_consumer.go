@@ -41,7 +41,7 @@ func NewFlashSaleConfirmationConsumer(
 		GroupID:        pkgKafka.ConsumerGroupProductFSConfirmation,
 		MinBytes:       1,
 		MaxBytes:       10e6,
-		CommitInterval: time.Second,
+		CommitInterval: 0,
 	})
 
 	return &FlashSaleConfirmationConsumer{
@@ -79,15 +79,62 @@ func (c *FlashSaleConfirmationConsumer) Start(ctx context.Context) {
 					continue
 				}
 
-				if err := c.processMessage(ctx, m); err != nil {
-					// Nếu lỗi retryable (DB, network), không commit offset, chờ backoff
-					logger.Error("❌ FlashSaleConfirmationConsumer lỗi xử lý message, retry sau", "error", err.Error())
-					time.Sleep(1 * time.Second)
-					continue
-				}
+				// 20.1 (P0): In-place retry loop cho đúng message 'm'
+				backoff := 500 * time.Millisecond
+				maxBackoff := 10 * time.Second
+				for {
+					if ctx.Err() != nil {
+						return
+					}
 
-				// Xử lý thành công hoặc đã đưa sang DLT -> commit offset
-				_ = c.reader.CommitMessages(ctx, m)
+					if err := c.processMessage(ctx, m); err != nil {
+						logger.Error("❌ FlashSaleConfirmationConsumer lỗi xử lý message, retry lại đúng message này",
+							"topic", m.Topic,
+							"partition", m.Partition,
+							"offset", m.Offset,
+							"backoff", backoff.String(),
+							"error", err.Error(),
+						)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+						continue
+					}
+
+					// Synchronous commit retry
+					commitBackoff := 500 * time.Millisecond
+					for {
+						if ctx.Err() != nil {
+							return
+						}
+						if commitErr := c.reader.CommitMessages(ctx, m); commitErr != nil {
+							logger.Error("❌ FlashSaleConfirmationConsumer lỗi commit offset, retry commit",
+								"topic", m.Topic,
+								"partition", m.Partition,
+								"offset", m.Offset,
+								"error", commitErr.Error(),
+							)
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(commitBackoff):
+							}
+							commitBackoff *= 2
+							if commitBackoff > maxBackoff {
+								commitBackoff = maxBackoff
+							}
+							continue
+						}
+						break
+					}
+					break // Hoàn tất message 'm', fetch message tiếp theo
+				}
 			}
 		}
 	}()
@@ -98,9 +145,11 @@ func (c *FlashSaleConfirmationConsumer) processMessage(ctx context.Context, m ka
 	if err := json.Unmarshal(m.Value, &payload); err != nil {
 		logger.Error("❌ FlashSaleConfirmationConsumer: Lỗi parse JSON payload", "error", err.Error())
 		if c.producer != nil {
-			_ = c.producer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, "Invalid JSON payload: "+err.Error(), "")
+			if dlqErr := c.producer.PublishDeadLetter(ctx, m.Topic, string(m.Key), m.Value, "Invalid JSON payload: "+err.Error(), ""); dlqErr != nil {
+				return fmt.Errorf("lỗi gửi DLQ cho confirmation message lỗi cú pháp: %w", dlqErr)
+			}
 		}
-		return nil // Commit poison message sau khi DLT
+		return nil // Commit poison message sau khi DLT thành công
 	}
 
 	traceID := payload.TraceID
@@ -115,9 +164,11 @@ func (c *FlashSaleConfirmationConsumer) processMessage(ctx context.Context, m ka
 			payload.EventID, payload.CampaignID, payload.ProductID, payload.Quantity)
 		logger.ErrorContext(reqCtx, "❌ FlashSaleConfirmationConsumer: Dữ liệu payload không hợp lệ", "error", errMsg)
 		if c.producer != nil {
-			_ = c.producer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, errMsg, traceID)
+			if dlqErr := c.producer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, errMsg, traceID); dlqErr != nil {
+				return fmt.Errorf("lỗi gửi DLQ cho confirmation message không hợp lệ: %w", dlqErr)
+			}
 		}
-		return nil // Poison message, bỏ qua sau khi DLT
+		return nil // Poison message, bỏ qua sau khi DLT thành công
 	}
 
 	// Thực hiện cập nhật sổ cái trong 1 Transaction của Product DB
@@ -161,7 +212,9 @@ func (c *FlashSaleConfirmationConsumer) processMessage(ctx context.Context, m ka
 		// Nếu lỗi do logic nghiệp vụ (vượt quá tồn kho phân bổ) -> Fatal -> Ghi DLT để tránh kẹt partition
 		if isInvariantViolation(dbErr) {
 			if c.producer != nil {
-				_ = c.producer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, dbErr.Error(), traceID)
+				if dlqErr := c.producer.PublishDeadLetter(reqCtx, m.Topic, string(m.Key), m.Value, dbErr.Error(), traceID); dlqErr != nil {
+					return fmt.Errorf("lỗi gửi DLQ cho invariant violation: %w", dlqErr)
+				}
 			}
 			return nil
 		}
