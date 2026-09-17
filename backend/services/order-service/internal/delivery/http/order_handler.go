@@ -27,14 +27,12 @@ func SetupOrderRoutes(rh *server.RestHandler, svc service.OrderService, redisCli
 	authMiddleware := middlewares.RequireAuth(rh.Config.AppSecret)
 
 	orderGroup := app.Group("/orders", authMiddleware)
-	orderGroup.Post("/", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
-	orderGroup.Post("/checkout", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
+	orderGroup.Post("/", handler.CreateOrder)
+	orderGroup.Post("/checkout", handler.CreateOrder)
 	orderGroup.Post("/checkout/quote", handler.GetBasketQuote) // 17.1: Báo giá trước khi đặt hàng giỏ hàng
-	orderGroup.Post("/direct", middlewares.IdempotencyMiddleware(redisClient), handler.CreateOrder)
+	orderGroup.Post("/direct", handler.CreateOrder)
 
-	// Flash Sale Routes
-	orderGroup.Post("/flash-sale", handler.CreateFlashSaleOrder)
-	orderGroup.Get("/flash-sale/status/:token", handler.GetFlashSaleStatus)
+
 	orderGroup.Post("/flash-sale/prewarm", middlewares.RequireRole(domain.RoleAdmin), handler.PrewarmStock)
 
 	orderGroup.Get("/", handler.GetUserOrders)
@@ -53,6 +51,28 @@ func (h *OrderHandler) CreateOrder(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Thông tin đặt hàng không hợp lệ", "INVALID_BODY")
 	}
 
+	headerKey := strings.TrimSpace(c.Get("Idempotency-Key"))
+	if headerKey == "" {
+		headerKey = strings.TrimSpace(c.Get("X-Idempotency-Key"))
+	}
+	bodyKey := strings.TrimSpace(req.IdempotencyKey)
+
+	// R3/Section 6.1: Nếu cung cấp cả header và body mà khác nhau thì trả 400
+	if headerKey != "" && bodyKey != "" && headerKey != bodyKey {
+		return response.BadRequest(c, "Idempotency-Key trong header và body không trùng khớp", dto.ErrCodeIdempotencyKeyMismatch)
+	}
+
+	finalKey := headerKey
+	if finalKey == "" {
+		finalKey = bodyKey
+	}
+
+	// R3/Section 6.1: Bắt buộc phải có key trước side effect, thiếu trả 400
+	if finalKey == "" {
+		return response.BadRequest(c, "Bắt buộc phải có Idempotency-Key (qua header Idempotency-Key hoặc body)", dto.ErrCodeIdempotencyKeyRequired)
+	}
+	req.IdempotencyKey = finalKey
+
 	order, err := h.svc.CreateOrder(c.UserContext(), userID, &req)
 	if err != nil {
 		if conflictErr, ok := err.(*service.PriceConflictError); ok {
@@ -64,11 +84,39 @@ func (h *OrderHandler) CreateOrder(c *fiber.Ctx) error {
 			})
 		}
 		errStr := err.Error()
-		if strings.Contains(errStr, "FLASH_SALE_OUT_OF_STOCK") ||
-			strings.Contains(errStr, "PRICE_CHANGED") ||
-			strings.Contains(errStr, "FLASH_SALE_QUOTA_EXCEEDED") ||
-			strings.Contains(errStr, "QUOTE_EXPIRED") {
-			return response.Error(c, fiber.StatusConflict, errStr, "CONFLICT_REQUOTE_REQUIRED")
+		if strings.Contains(errStr, dto.ErrCodeFlashSaleUnavailable) || strings.Contains(errStr, "FLASH_SALE_SERVICE_UNAVAILABLE") {
+			return response.Error(c, fiber.StatusServiceUnavailable, errStr, dto.ErrCodeFlashSaleUnavailable)
+		}
+		if strings.Contains(errStr, dto.ErrCodeCheckoutRetryable) {
+			return response.Error(c, fiber.StatusServiceUnavailable, errStr, dto.ErrCodeCheckoutRetryable)
+		}
+		if strings.Contains(errStr, dto.ErrCodeCheckoutOutcomeUnknown) {
+			return response.Error(c, fiber.StatusServiceUnavailable, errStr, dto.ErrCodeCheckoutOutcomeUnknown)
+		}
+		if strings.Contains(errStr, dto.ErrCodeOrderProcessing) {
+			return response.Error(c, fiber.StatusConflict, errStr, dto.ErrCodeOrderProcessing)
+		}
+		if strings.Contains(errStr, dto.ErrCodeIdempotencyConflict) {
+			return response.Error(c, fiber.StatusConflict, errStr, dto.ErrCodeIdempotencyConflict)
+		}
+		if strings.Contains(errStr, dto.ErrCodeQuoteChanged) || strings.Contains(errStr, "PRICE_CHANGED") {
+			return response.Error(c, fiber.StatusConflict, errStr, dto.ErrCodeQuoteChanged)
+		}
+		if strings.Contains(errStr, dto.ErrCodeQuoteExpired) || strings.Contains(errStr, "QUOTE_EXPIRED") {
+			return response.Error(c, fiber.StatusConflict, errStr, dto.ErrCodeQuoteExpired)
+		}
+		if strings.Contains(errStr, "CAMPAIGN_ENDED") ||
+			strings.Contains(errStr, "CAMPAIGN_NOT_FOUND") ||
+			strings.Contains(errStr, "ALLOCATION_EXCEEDED") ||
+			strings.Contains(errStr, "FLASH_SALE_OUT_OF_STOCK") ||
+			strings.Contains(errStr, "FLASH_SALE_QUOTA_EXCEEDED") {
+			return response.Error(c, fiber.StatusConflict, errStr, "FLASH_SALE_UNAVAILABLE")
+		}
+		if strings.Contains(errStr, dto.ErrCodeIdempotencyKeyRequired) {
+			return response.BadRequest(c, errStr, dto.ErrCodeIdempotencyKeyRequired)
+		}
+		if strings.Contains(errStr, dto.ErrCodeIdempotencyKeyMismatch) {
+			return response.BadRequest(c, errStr, dto.ErrCodeIdempotencyKeyMismatch)
 		}
 		return response.BadRequest(c, errStr, "CREATE_ORDER_FAILED")
 	}
@@ -96,38 +144,6 @@ func (h *OrderHandler) GetBasketQuote(c *fiber.Ctx) error {
 	return response.Success(c, http.StatusOK, "Báo giá giỏ hàng thành công", quote)
 }
 
-func (h *OrderHandler) CreateFlashSaleOrder(c *fiber.Ctx) error {
-	userID, _ := c.Locals("userID").(string)
-	if userID == "" {
-		return response.Unauthorized(c, "Bạn chưa đăng nhập")
-	}
-
-	var req dto.FlashSaleOrderRequest
-	if err := c.BodyParser(&req); err != nil {
-		return response.BadRequest(c, "Thông tin đặt hàng Flash Sale không hợp lệ", "INVALID_BODY")
-	}
-
-	res, err := h.svc.CreateFlashSaleOrderAsync(c.UserContext(), userID, &req)
-	if err != nil {
-		return response.BadRequest(c, err.Error(), "FLASH_SALE_FAILED")
-	}
-
-	return response.Success(c, http.StatusAccepted, "Đã tiếp nhận đơn hàng Flash Sale vào hàng đợi", res)
-}
-
-func (h *OrderHandler) GetFlashSaleStatus(c *fiber.Ctx) error {
-	token := c.Params("token")
-	if token == "" {
-		return response.BadRequest(c, "Mã token không hợp lệ", "INVALID_TOKEN")
-	}
-
-	status, err := h.svc.GetFlashSaleOrderStatus(c.UserContext(), token)
-	if err != nil {
-		return response.InternalError(c, "Lỗi kiểm tra trạng thái: "+err.Error())
-	}
-
-	return response.Success(c, http.StatusOK, "Lấy trạng thái đơn hàng thành công", status)
-}
 
 func (h *OrderHandler) PrewarmStock(c *fiber.Ctx) error {
 	var req dto.PrewarmStockRequest

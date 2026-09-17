@@ -2,15 +2,18 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	pkgKafka "ecomerce-service/pkg/kafka"
 	"ecomerce-service/pkg/logger"
 	"ecomerce-service/pkg/redislock"
 	"ecomerce-service/services/order-service/internal/client"
 	"ecomerce-service/services/order-service/internal/domain"
 	"ecomerce-service/services/order-service/internal/dto"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +23,65 @@ import (
 	"gorm.io/gorm"
 )
 
+const CanonicalFingerprintVersion = 1
+
+type canonicalFingerprintStruct struct {
+	Version         int                          `json:"version"`
+	UserID          string                       `json:"user_id"`
+	CustomerName    string                       `json:"customer_name"`
+	CustomerEmail   string                       `json:"customer_email"`
+	CustomerPhone   string                       `json:"customer_phone"`
+	ShippingAddress string                       `json:"shipping_address"`
+	Note            string                       `json:"note"`
+	PaymentMethod   string                       `json:"payment_method"`
+	QuoteToken      string                       `json:"quote_token"`
+	FromCart        bool                         `json:"from_cart"`
+	Items           []dto.CreateOrderItemRequest `json:"items,omitempty"`
+}
+
+// normalizeAndMergeItems chuẩn hóa gộp các dòng cùng ProductID và sort tăng dần (R5)
+func normalizeAndMergeItems(rawItems []dto.CreateOrderItemRequest) []dto.CreateOrderItemRequest {
+	if len(rawItems) == 0 {
+		return nil
+	}
+	merged := make(map[uint]int)
+	for _, item := range rawItems {
+		if item.Quantity > 0 {
+			merged[item.ProductID] += item.Quantity
+		}
+	}
+	items := make([]dto.CreateOrderItemRequest, 0, len(merged))
+	for productID, qty := range merged {
+		items = append(items, dto.CreateOrderItemRequest{
+			ProductID: productID,
+			Quantity:  qty,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ProductID < items[j].ProductID
+	})
+	return items
+}
+
+func computeCanonicalFingerprint(userID string, req *dto.CreateOrderRequest) string {
+	payload := canonicalFingerprintStruct{
+		Version:         CanonicalFingerprintVersion,
+		UserID:          strings.TrimSpace(userID),
+		CustomerName:    strings.TrimSpace(req.CustomerName),
+		CustomerEmail:   strings.ToLower(strings.TrimSpace(req.CustomerEmail)),
+		CustomerPhone:   strings.TrimSpace(req.CustomerPhone),
+		ShippingAddress: strings.TrimSpace(req.ShippingAddress),
+		Note:            strings.TrimSpace(req.Note),
+		PaymentMethod:   strings.TrimSpace(req.PaymentMethod),
+		QuoteToken:      strings.TrimSpace(req.QuoteToken),
+		FromCart:        req.FromCart,
+		Items:           normalizeAndMergeItems(req.Items),
+	}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 type OrderService interface {
 	CreateOrder(ctx context.Context, userID string, req *dto.CreateOrderRequest) (*dto.OrderResponse, error)
 	GetBasketQuote(ctx context.Context, userID string, req *dto.BasketQuoteRequest) (*dto.BasketQuoteResponse, error)
@@ -27,9 +89,6 @@ type OrderService interface {
 	GetUserOrders(ctx context.Context, userID string, page int, limit int) (*dto.OrderListResponse, error)
 	UpdateOrderStatus(ctx context.Context, orderID uint, req *dto.UpdateOrderStatusRequest) error
 
-	// Flash Sale High-Concurrency Methods
-	CreateFlashSaleOrderAsync(ctx context.Context, userID string, req *dto.FlashSaleOrderRequest) (*dto.FlashSaleOrderAsyncResponse, error)
-	GetFlashSaleOrderStatus(ctx context.Context, token string) (*dto.FlashSaleStatusResponse, error)
 	PrewarmStock(ctx context.Context, productID uint, stock int) error
 }
 
@@ -78,22 +137,304 @@ func (s *orderService) SetFlashSale(db *gorm.DB, fsRepo domain.FlashSaleReposito
 	s.fsRepo = fsRepo
 }
 
+type ManifestItem struct {
+	CampaignID    uint   `json:"campaign_id"`
+	ProductID     uint   `json:"product_id"`
+	ReservationID string `json:"reservation_id"`
+}
+
+type flashSaleItemReserveInfo struct {
+	itemIndex       int
+	campaignID      uint
+	flashSaleItemID uint
+	productID       uint
+	salePrice       float64
+	reservationID   string
+	quantity        int
+}
+
+func (s *orderService) recoverAttemptManifest(ctx context.Context, attempt *domain.CheckoutAttempt) {
+	if attempt == nil || attempt.ManifestJSON == "" || s.redisClient == nil {
+		return
+	}
+	var items []ManifestItem
+	if err := json.Unmarshal([]byte(attempt.ManifestJSON), &items); err != nil {
+		return
+	}
+	for _, item := range items {
+		_, _ = redislock.CloseOrReleaseReservation(ctx, s.redisClient, item.CampaignID, item.ProductID, item.ReservationID)
+	}
+}
+
+func (s *orderService) resolveCommitOutcome(
+	ctx context.Context,
+	attempt *domain.CheckoutAttempt,
+	workerOwnerToken string,
+	reservedList []flashSaleItemReserveInfo,
+) (*dto.OrderResponse, bool) {
+	if attempt == nil || attempt.ID == 0 || s.db == nil {
+		for _, rev := range reservedList {
+			if s.redisClient != nil {
+				_, _ = redislock.CloseOrReleaseReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID)
+			}
+		}
+		return nil, true
+	}
+
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var lockedAttempt domain.CheckoutAttempt
+	var order domain.Order
+	var isCompleted bool
+	var lostOwnership bool
+	var canCleanup bool
+
+	txErr := s.db.WithContext(recoveryCtx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("id = ?", attempt.ID).First(&lockedAttempt).Error; err != nil {
+			return err
+		}
+
+		if lockedAttempt.Status == domain.CheckoutAttemptStatusCompleted {
+			isCompleted = true
+			if lockedAttempt.OrderID != nil {
+				_ = tx.Preload("Items").Where("id = ?", *lockedAttempt.OrderID).First(&order).Error
+			}
+			return nil
+		}
+
+		if lockedAttempt.Version != attempt.Version || lockedAttempt.OwnerToken != workerOwnerToken {
+			lostOwnership = true
+			return nil
+		}
+
+		canCleanup = true
+		lockedAttempt.Status = domain.CheckoutAttemptStatusRecovering
+		lockedAttempt.Version++
+		lockedAttempt.RecoveryTarget = "ROLLBACK_CLEANUP"
+		lockedAttempt.UpdatedAt = time.Now()
+		return tx.Save(&lockedAttempt).Error
+	})
+
+	if txErr != nil {
+		logger.ErrorContext(ctx, "Outcome resolution timeout hoặc DB lỗi", "error", txErr.Error())
+		return nil, false
+	}
+
+	if isCompleted {
+		if lockedAttempt.ResponsePayload != "" {
+			var resp dto.OrderResponse
+			if err := json.Unmarshal([]byte(lockedAttempt.ResponsePayload), &resp); err == nil && resp.ID > 0 {
+				return &resp, true
+			}
+		}
+		if order.ID > 0 {
+			resp := s.toOrderResponse(&order)
+			return resp, true
+		}
+		return nil, false
+	}
+
+	if lostOwnership {
+		return nil, true
+	}
+
+	if canCleanup {
+		for _, rev := range reservedList {
+			if s.redisClient != nil {
+				_, _ = redislock.CloseOrReleaseReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID)
+			}
+		}
+		_, _ = s.orderRepo.TransitionAttemptStatus(lockedAttempt.ID, lockedAttempt.Version, domain.CheckoutAttemptStatusRetryable, "ROLLBACK_DONE")
+		return nil, true
+	}
+
+	return nil, false
+}
+
 func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.CreateOrderRequest) (*dto.OrderResponse, error) {
+	if req == nil {
+		return nil, errors.New("request không được rỗng")
+	}
+
+	// R5: Chuẩn hóa trên bản sao cục bộ để tránh data race trên pointer truyền vào từ concurrent caller
+	clonedReq := *req
+	clonedReq.CustomerName = strings.TrimSpace(req.CustomerName)
+	clonedReq.CustomerEmail = strings.ToLower(strings.TrimSpace(req.CustomerEmail))
+	clonedReq.CustomerPhone = strings.TrimSpace(req.CustomerPhone)
+	clonedReq.ShippingAddress = strings.TrimSpace(req.ShippingAddress)
+	clonedReq.Note = strings.TrimSpace(req.Note)
+	clonedReq.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
+	clonedReq.QuoteToken = strings.TrimSpace(req.QuoteToken)
+	clonedReq.Items = normalizeAndMergeItems(req.Items)
+	req = &clonedReq
+
 	if req.CustomerName == "" || req.CustomerEmail == "" || req.CustomerPhone == "" || req.ShippingAddress == "" {
 		return nil, errors.New("vui lòng điền đầy đủ thông tin nhận hàng (Họ tên, Email, Số điện thoại, Địa chỉ)")
 	}
 
-	// 16.5 & 17.1 & 18.2: Bắt buộc và xác thực QuoteToken ngay từ cửa vào (Fail-fast)
+	// 10.2 & 10.3 & R1 & R2 & R5: Canonical Request Fingerprint, Fencing Tokens & CAS State Machine
+	requestFingerprint := computeCanonicalFingerprint(userID, req)
+	var currentAttempt *domain.CheckoutAttempt
+	workerOwnerToken := uuid.New().String()
+	now := time.Now()
+	leaseExp := now.Add(1 * time.Minute)
+
+	if req.IdempotencyKey != "" && s.orderRepo != nil {
+		existingAttempt, err := s.orderRepo.GetCheckoutAttempt(userID, req.IdempotencyKey)
+		if err != nil {
+			return nil, fmt.Errorf("DB_ERROR: không thể kiểm tra idempotency: %w", err)
+		}
+		if existingAttempt != nil {
+			if existingAttempt.RequestFingerprint != requestFingerprint {
+				return nil, errors.New("IDEMPOTENCY_CONFLICT: Idempotency-Key đã được sử dụng cho một yêu cầu đặt hàng khác")
+			}
+			if existingAttempt.Status == domain.CheckoutAttemptStatusCompleted {
+				if existingAttempt.ResponsePayload != "" {
+					var replayResp dto.OrderResponse
+					if err := json.Unmarshal([]byte(existingAttempt.ResponsePayload), &replayResp); err == nil {
+						logger.InfoContext(ctx, "Replay kết quả đơn hàng từ CheckoutAttempt bền vững (Zero Quote Expiration check)",
+							"idempotency_key", req.IdempotencyKey, "order_id", replayResp.ID)
+						return &replayResp, nil
+					}
+				}
+				if existingAttempt.OrderID != nil {
+					if order, err := s.orderRepo.FindByID(*existingAttempt.OrderID); err == nil && order != nil {
+						return s.toOrderResponse(order), nil
+					}
+				}
+				return nil, errors.New("CHECKOUT_OUTCOME_UNKNOWN: Không thể phục hồi dữ liệu đơn hàng đã tiếp nhận")
+			}
+			if existingAttempt.Status == domain.CheckoutAttemptStatusRejected {
+				reason := existingAttempt.RecoveryTarget
+				if reason == "" {
+					reason = "Yêu cầu đã bị từ chối"
+				}
+				return nil, fmt.Errorf("IDEMPOTENCY_CONFLICT: Yêu cầu đặt hàng trước đó đã bị từ chối (%s)", reason)
+			}
+			if existingAttempt.Status == domain.CheckoutAttemptStatusPending {
+				if existingAttempt.LeaseExpiresAt != nil && existingAttempt.LeaseExpiresAt.After(now) {
+					return nil, errors.New("ORDER_PROCESSING: Yêu cầu đặt hàng đang được xử lý, vui lòng không gửi lại")
+				}
+				// Lease đã hết hạn -> Takeover CAS sang RECOVERING (Mục 3.2 & 3.3)
+				updated, claimed, err := s.orderRepo.CASRecoveringTakeover(existingAttempt.ID, existingAttempt.Version, workerOwnerToken, leaseExp, "TAKEOVER_RECOVERY")
+				if err != nil || !claimed || updated == nil {
+					return nil, errors.New("ORDER_PROCESSING: Yêu cầu đặt hàng đang được xử lý bởi worker khác")
+				}
+				s.recoverAttemptManifest(ctx, updated)
+				updated.Status = domain.CheckoutAttemptStatusPending
+				updated.OwnerToken = workerOwnerToken
+				updated.Version++
+				updated.LeaseExpiresAt = &leaseExp
+				_ = s.orderRepo.SaveCheckoutAttempt(updated)
+				currentAttempt = updated
+			} else if existingAttempt.Status == domain.CheckoutAttemptStatusRecovering {
+				if existingAttempt.LeaseExpiresAt != nil && existingAttempt.LeaseExpiresAt.After(now) {
+					return nil, errors.New("ORDER_PROCESSING: Yêu cầu đang được phục hồi sau sự cố, vui lòng thử lại sau giây lát")
+				}
+				updated, claimed, err := s.orderRepo.CASRecoveringTakeover(existingAttempt.ID, existingAttempt.Version, workerOwnerToken, leaseExp, "RECOVERING_TIMEOUT")
+				if err != nil || !claimed || updated == nil {
+					return nil, errors.New("ORDER_PROCESSING: Quá trình phục hồi đang diễn ra bởi worker khác")
+				}
+				s.recoverAttemptManifest(ctx, updated)
+				updated.Status = domain.CheckoutAttemptStatusPending
+				updated.OwnerToken = workerOwnerToken
+				updated.Version++
+				updated.LeaseExpiresAt = &leaseExp
+				_ = s.orderRepo.SaveCheckoutAttempt(updated)
+				currentAttempt = updated
+			} else if existingAttempt.Status == domain.CheckoutAttemptStatusRetryable {
+				// Retryable: CAS claim lại thành PENDING với generation mới (Mục 3.1)
+				existingAttempt.Status = domain.CheckoutAttemptStatusPending
+				existingAttempt.OwnerToken = workerOwnerToken
+				existingAttempt.Version++
+				existingAttempt.LeaseExpiresAt = &leaseExp
+				existingAttempt.RecoveryTarget = ""
+				existingAttempt.ManifestJSON = ""
+				existingAttempt.UpdatedAt = now
+				if err := s.orderRepo.SaveCheckoutAttempt(existingAttempt); err != nil {
+					return nil, errors.New("ORDER_PROCESSING: Không thể claim attempt retryable")
+				}
+				currentAttempt = existingAttempt
+			} else if existingAttempt.Status == domain.CheckoutAttemptStatusFailed {
+				// Legacy FAILED recovery
+				if existingAttempt.OrderID != nil {
+					existingAttempt.Status = domain.CheckoutAttemptStatusCompleted
+					_ = s.orderRepo.SaveCheckoutAttempt(existingAttempt)
+					if order, err := s.orderRepo.FindByID(*existingAttempt.OrderID); err == nil && order != nil {
+						return s.toOrderResponse(order), nil
+					}
+				}
+				s.recoverAttemptManifest(ctx, existingAttempt)
+				existingAttempt.Status = domain.CheckoutAttemptStatusPending
+				existingAttempt.OwnerToken = workerOwnerToken
+				existingAttempt.Version++
+				existingAttempt.LeaseExpiresAt = &leaseExp
+				existingAttempt.UpdatedAt = now
+				_ = s.orderRepo.SaveCheckoutAttempt(existingAttempt)
+				currentAttempt = existingAttempt
+			}
+		} else {
+			// Insert attempt mới với status PENDING, version 1
+			newAttempt := &domain.CheckoutAttempt{
+				UserID:             userID,
+				IdempotencyKey:     req.IdempotencyKey,
+				RequestFingerprint: requestFingerprint,
+				FingerprintVersion: CanonicalFingerprintVersion,
+				Status:             domain.CheckoutAttemptStatusPending,
+				OwnerToken:         workerOwnerToken,
+				Version:            1,
+				LeaseExpiresAt:     &leaseExp,
+				CreatedAt:          now,
+				UpdatedAt:          now,
+			}
+			if err := s.orderRepo.CreateCheckoutAttempt(newAttempt); err != nil {
+				// Cạnh tranh song song -> tải lại attempt đã có
+				loaded, getErr := s.orderRepo.GetCheckoutAttempt(userID, req.IdempotencyKey)
+				if getErr != nil || loaded == nil {
+					return nil, errors.New("ORDER_PROCESSING: Xung đột tạo attempt, vui lòng thử lại")
+				}
+				if loaded.RequestFingerprint != requestFingerprint {
+					return nil, errors.New("IDEMPOTENCY_CONFLICT: Idempotency-Key đã được sử dụng cho một yêu cầu đặt hàng khác")
+				}
+				if loaded.Status == domain.CheckoutAttemptStatusCompleted && loaded.ResponsePayload != "" {
+					var replayResp dto.OrderResponse
+					if err := json.Unmarshal([]byte(loaded.ResponsePayload), &replayResp); err == nil {
+						return &replayResp, nil
+					}
+				}
+				return nil, errors.New("ORDER_PROCESSING: Yêu cầu đặt hàng đang được xử lý, vui lòng không gửi lại")
+			}
+			currentAttempt = newAttempt
+		}
+	}
+
+	rejectAttempt := func(reason string) {
+		if currentAttempt != nil && currentAttempt.ID > 0 {
+			_, _ = s.orderRepo.TransitionAttemptStatus(currentAttempt.ID, currentAttempt.Version, domain.CheckoutAttemptStatusRejected, reason)
+		}
+	}
+
+	// 16.5 & 17.1 & 18.2: Bắt buộc và xác thực QuoteToken khi không phải replay đơn đã xong (Fail-fast)
 	if req.QuoteToken == "" {
+		rejectAttempt("QUOTE_REQUIRED")
 		return nil, errors.New("QUOTE_REQUIRED: Bắt buộc phải có quote_token hợp lệ để tiến hành đặt hàng")
 	}
 
 	quotePayload, qErr := VerifyQuoteToken(s.quoteSecret, req.QuoteToken, userID)
 	if qErr != nil {
 		if qErr == ErrQuoteExpired {
+			rejectAttempt("QUOTE_EXPIRED")
 			return nil, fmt.Errorf("QUOTE_EXPIRED: %w", qErr)
 		}
+		rejectAttempt("INVALID_QUOTE_TOKEN")
 		return nil, fmt.Errorf("INVALID_QUOTE_TOKEN: %w", qErr)
+	}
+
+	quotedMap := make(map[uint]QuoteItem)
+	for _, qItem := range quotePayload.Items {
+		quotedMap[qItem.ProductID] = qItem
 	}
 
 	var orderItems []domain.OrderItem
@@ -110,36 +451,85 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 			return nil, errors.New("giỏ hàng của bạn đang trống, không thể tạo đơn")
 		}
 
-		for _, item := range cart.Items {
-			subtotal := item.Price * float64(item.Quantity)
-			totalAmount += subtotal
-			orderItems = append(orderItems, domain.OrderItem{
-				ProductID:   item.ProductID,
-				ProductName: item.ProductName,
-				ProductSlug: item.ProductSlug,
-				Thumbnail:   item.Thumbnail,
-				Price:       item.Price,
-				Quantity:    item.Quantity,
-				Subtotal:    subtotal,
-			})
+		if len(req.Items) > 0 {
+			// Snapshot items được chỉ định rõ (chuẩn Checkout Snapshot)
+			cartItemMap := make(map[uint]*domain.CartItem)
+			for i := range cart.Items {
+				cartItemMap[cart.Items[i].ProductID] = &cart.Items[i]
+			}
+
+			groupedMap := make(map[uint]int)
+			var uniqueProductIDs []uint
+			for _, itemReq := range req.Items {
+				if itemReq.ProductID == 0 || itemReq.Quantity <= 0 {
+					return nil, errors.New("món hàng không hợp lệ")
+				}
+				if _, exists := groupedMap[itemReq.ProductID]; !exists {
+					uniqueProductIDs = append(uniqueProductIDs, itemReq.ProductID)
+				}
+				groupedMap[itemReq.ProductID] += itemReq.Quantity
+			}
+
+			for _, pid := range uniqueProductIDs {
+				qty := groupedMap[pid]
+				cItem, exists := cartItemMap[pid]
+				if !exists || cItem.Quantity < qty {
+					return nil, fmt.Errorf("sản phẩm #%d trong giỏ hàng không đủ số lượng để thanh toán", pid)
+				}
+				subtotal := cItem.Price * float64(qty)
+				totalAmount += subtotal
+				orderItems = append(orderItems, domain.OrderItem{
+					ProductID:   cItem.ProductID,
+					ProductName: cItem.ProductName,
+					ProductSlug: cItem.ProductSlug,
+					Thumbnail:   cItem.Thumbnail,
+					Price:       cItem.Price,
+					Quantity:    qty,
+					Subtotal:    subtotal,
+				})
+			}
+		} else {
+			for _, item := range cart.Items {
+				subtotal := item.Price * float64(item.Quantity)
+				totalAmount += subtotal
+				orderItems = append(orderItems, domain.OrderItem{
+					ProductID:   item.ProductID,
+					ProductName: item.ProductName,
+					ProductSlug: item.ProductSlug,
+					Thumbnail:   item.Thumbnail,
+					Price:       item.Price,
+					Quantity:    item.Quantity,
+					Subtotal:    subtotal,
+				})
+			}
 		}
 	} else {
 		if len(req.Items) == 0 {
 			return nil, errors.New("danh sách sản phẩm đặt hàng không được rỗng")
 		}
 
+		// P0: Basket Normalization - Gộp các dòng trùng product_id
+		groupedMap := make(map[uint]int)
+		var uniqueProductIDs []uint
 		for _, itemReq := range req.Items {
 			if itemReq.ProductID == 0 || itemReq.Quantity <= 0 {
 				return nil, errors.New("món hàng không hợp lệ")
 			}
+			if _, exists := groupedMap[itemReq.ProductID]; !exists {
+				uniqueProductIDs = append(uniqueProductIDs, itemReq.ProductID)
+			}
+			groupedMap[itemReq.ProductID] += itemReq.Quantity
+		}
 
+		for _, pid := range uniqueProductIDs {
+			qty := groupedMap[pid]
 			var name, slug, thumbnail string
 			var price float64
 
 			if s.productClient != nil {
-				prod, err := s.productClient.GetProduct(ctx, itemReq.ProductID)
+				prod, err := s.productClient.GetProduct(ctx, pid)
 				if err != nil || prod == nil {
-					return nil, fmt.Errorf("sản phẩm #%d không tồn tại", itemReq.ProductID)
+					return nil, fmt.Errorf("sản phẩm #%d không tồn tại", pid)
 				}
 				name = prod.Name
 				slug = prod.Slug
@@ -149,32 +539,25 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 				} else {
 					price = prod.Price
 				}
+			} else if quoted, ok := quotedMap[pid]; ok {
+				price = quoted.QuotedPrice
 			}
 
-			subtotal := price * float64(itemReq.Quantity)
+			subtotal := price * float64(qty)
 			totalAmount += subtotal
 			orderItems = append(orderItems, domain.OrderItem{
-				ProductID:   itemReq.ProductID,
+				ProductID:   pid,
 				ProductName: name,
 				ProductSlug: slug,
 				Thumbnail:   thumbnail,
 				Price:       price,
-				Quantity:    itemReq.Quantity,
+				Quantity:    qty,
 				Subtotal:    subtotal,
 			})
 		}
 	}
 
 	// 1. Kiểm tra và áp dụng ưu đãi Flash Sale cho từng món hàng nếu có active campaign
-	type flashSaleItemReserveInfo struct {
-		itemIndex       int
-		campaignID      uint
-		flashSaleItemID uint // Point 1: Phải là FlashSaleItem.ID chính xác
-		productID       uint
-		salePrice       float64
-		reservationID   string
-		quantity        int
-	}
 	var fsReserves []flashSaleItemReserveInfo
 	hasFlashSale := false
 
@@ -191,9 +574,8 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 		return nil, fmt.Errorf("INVALID_QUOTE_TOKEN: %w", err)
 	}
 
-	quotedMap := make(map[uint]QuoteItem)
-	for _, qItem := range quotePayload.Items {
-		quotedMap[qItem.ProductID] = qItem
+	if s.db == nil {
+		return nil, errors.New("DATABASE_REQUIRED: Hệ thống đặt hàng yêu cầu kết nối cơ sở dữ liệu để thực hiện transaction")
 	}
 
 	var affectedItems []dto.PriceConflictItem
@@ -236,20 +618,33 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 			}
 
 			if it, exists := activeMap[pid]; exists && isCampActive {
-				remaining := it.AllocatedStock - it.SoldStock - it.ReservedStock
-				if s.redisClient != nil {
-					stockKey := redislock.KeyStock(camp.ID, pid)
-					if stockVal, err := s.redisClient.Get(ctx, stockKey).Int(); err == nil {
-						remaining = stockVal
-					}
+				// 10.4: Fail-Closed Redis Policy: Đơn có Flash Sale bắt buộc Redis phải online
+				if s.redisClient == nil {
+					rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+					return nil, errors.New("FLASH_SALE_SERVICE_UNAVAILABLE: Hệ thống Flash Sale tạm thời gián đoạn (Redis nil). Vui lòng thử lại sau ít phút")
 				}
+				stockKey := redislock.KeyStock(camp.ID, pid)
+				stockVal, err := s.redisClient.Get(ctx, stockKey).Int()
+				if err != nil {
+					rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+					return nil, fmt.Errorf("FLASH_SALE_SERVICE_UNAVAILABLE: Không thể kiểm tra tồn kho Flash Sale (%w)", err)
+				}
+				remaining := stockVal
 
 				isEligible := true
-				if userID != "" && it.MaxQuantityPerUser > 0 && s.redisClient != nil {
+				if userID != "" && it.MaxQuantityPerUser > 0 {
 					resvKey := fmt.Sprintf("fs:{c:%d:p:%d}:user:%s:resv", camp.ID, pid, userID)
 					purchasedKey := fmt.Sprintf("fs:{c:%d:p:%d}:user:%s:purchased", camp.ID, pid, userID)
-					resvQty, _ := s.redisClient.Get(ctx, resvKey).Int()
-					purchasedQty, _ := s.redisClient.Get(ctx, purchasedKey).Int()
+					resvQty, err1 := s.redisClient.Get(ctx, resvKey).Int()
+					if err1 != nil && !errors.Is(err1, redis.Nil) {
+						rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+						return nil, fmt.Errorf("FLASH_SALE_SERVICE_UNAVAILABLE: Không thể kiểm tra hạn mức mua hàng Flash Sale (%w)", err1)
+					}
+					purchasedQty, err2 := s.redisClient.Get(ctx, purchasedKey).Int()
+					if err2 != nil && !errors.Is(err2, redis.Nil) {
+						rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+						return nil, fmt.Errorf("FLASH_SALE_SERVICE_UNAVAILABLE: Không thể kiểm tra hạn mức mua hàng Flash Sale (%w)", err2)
+					}
 					if resvQty+purchasedQty+orderItems[idx].Quantity > it.MaxQuantityPerUser {
 						isEligible = false
 					}
@@ -345,6 +740,7 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 
 	// 16.5 & 17.1: Nếu có bất kỳ thay đổi giá hoặc hết suất/hết hạn sale, từ chối tạo đơn và trả về 409 Re-quote
 	if len(affectedItems) > 0 {
+		rejectAttempt("PRICE_CHANGED")
 		var newQuoteItems []QuoteItem
 		var newQuoteLines []dto.QuoteLineDTO
 		var newTotal float64
@@ -396,32 +792,78 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 
 	orderCode := fmt.Sprintf("ORD-%s", strings.ToUpper(uuid.New().String()[:8]))
 
-	// Route mọi checkout có DB qua cùng Saga trừ kho có operation ledger và
-	// transactional outbox. Đường legacy order.created -> ProductStockWorker
-	// không an toàn khi publish result lỗi rồi message được giao lại.
 	if s.db != nil {
-		if hasFlashSale && req.PaymentMethod != domain.PaymentMethodCOD {
-			return nil, errors.New("đơn hàng có sản phẩm Flash Sale hiện chỉ hỗ trợ phương thức thanh toán khi nhận hàng (COD)")
+		if hasFlashSale {
+			// 10.4: Fail-Closed Redis Policy: Đơn có Flash Sale bắt buộc Redis phải online
+			if s.redisClient == nil {
+				rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+				return nil, errors.New("FLASH_SALE_SERVICE_UNAVAILABLE: Hệ thống Flash Sale tạm thời gián đoạn (Redis nil). Vui lòng thử lại sau ít phút")
+			}
+			if err := s.redisClient.Ping(ctx).Err(); err != nil {
+				rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+				return nil, fmt.Errorf("FLASH_SALE_SERVICE_UNAVAILABLE: Hệ thống Flash Sale tạm thời gián đoạn (%w). Vui lòng thử lại sau ít phút", err)
+			}
+			if req.PaymentMethod != domain.PaymentMethodCOD {
+				rejectAttempt("COD_REQUIRED")
+				return nil, errors.New("đơn hàng có sản phẩm Flash Sale hiện chỉ hỗ trợ phương thức thanh toán khi nhận hàng (COD)")
+			}
+		}
+
+		// Mục 3.3: Chốt ID ổn định theo (attempt_id, generation, campaign_id, product_id)
+		var manifestItems []ManifestItem
+		var attemptID uint
+		var attemptVer uint64 = 1
+		if currentAttempt != nil {
+			attemptID = currentAttempt.ID
+			attemptVer = currentAttempt.Version
+		}
+		for _, fs := range fsReserves {
+			resvID := fmt.Sprintf("FSR-%d-%d-%d-%d", attemptID, attemptVer, fs.campaignID, fs.productID)
+			manifestItems = append(manifestItems, ManifestItem{
+				CampaignID:    fs.campaignID,
+				ProductID:     fs.productID,
+				ReservationID: resvID,
+			})
+		}
+		// Trước khi gọi Lua, persist manifest các ID dự định giữ (Mục 3.3)
+		if currentAttempt != nil && len(manifestItems) > 0 {
+			manifestBytes, _ := json.Marshal(manifestItems)
+			currentAttempt.ManifestJSON = string(manifestBytes)
+			_ = s.orderRepo.SaveCheckoutAttempt(currentAttempt)
 		}
 
 		// Giữ chỗ từng món Flash Sale trên Redis (TTL 5 phút)
 		var reservedList []flashSaleItemReserveInfo
-		for _, fs := range fsReserves {
-			resvID := fmt.Sprintf("FSR-MIX-%s", strings.ToUpper(uuid.New().String()[:8]))
-			if s.redisClient != nil {
-				resp, err := redislock.ReserveFlashSaleStock(
-					ctx, s.redisClient,
-					fs.campaignID, fs.productID,
-					userID, fmt.Sprintf("req-%s", resvID), "mixed-checkout", resvID,
-					fs.quantity,
-					300,
-				)
-				if err != nil || (resp != nil && resp.Code != redislock.ResultReserved) {
-					for _, rev := range reservedList {
-						_, _ = redislock.ReleaseFlashSaleReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID, "CANCELLED")
-					}
-					return nil, fmt.Errorf("FLASH_SALE_OUT_OF_STOCK: sản phẩm #%d không thể giữ chỗ trên Redis", fs.productID)
+		for idx, fs := range fsReserves {
+			resvID := manifestItems[idx].ReservationID
+			if s.redisClient == nil {
+				rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+				return nil, errors.New("FLASH_SALE_SERVICE_UNAVAILABLE: Hệ thống Flash Sale tạm thời gián đoạn")
+			}
+			resp, err := redislock.ReserveFlashSaleStock(
+				ctx, s.redisClient,
+				fs.campaignID, fs.productID,
+				userID, fmt.Sprintf("req-%s", resvID), "mixed-checkout", resvID,
+				fs.quantity,
+				300,
+			)
+			if err != nil {
+				for _, rev := range reservedList {
+					_, _ = redislock.CloseOrReleaseReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID)
 				}
+				rejectAttempt("FLASH_SALE_SERVICE_UNAVAILABLE")
+				return nil, fmt.Errorf("FLASH_SALE_SERVICE_UNAVAILABLE: lỗi giữ chỗ tồn kho trên Redis: %w", err)
+			}
+			if resp == nil || resp.Code != redislock.ResultReserved {
+				for _, rev := range reservedList {
+					_, _ = redislock.CloseOrReleaseReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID)
+				}
+				code := "UNKNOWN"
+				if resp != nil {
+					code = string(resp.Code)
+				}
+				rejectAttempt("FLASH_SALE_OUT_OF_STOCK")
+				return nil, fmt.Errorf("FLASH_SALE_OUT_OF_STOCK: sản phẩm #%d không thể giữ chỗ trên Redis (code: %s)", fs.productID, code)
 			}
 			fs.reservationID = resvID
 			orderItems[fs.itemIndex].ReservationID = resvID
@@ -465,7 +907,53 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 
 		if s.db != nil {
 			txErr = s.db.Transaction(func(tx *gorm.DB) error {
-				// 1. Tạo đơn hàng và chi tiết
+				// Bước 1 & 2 (Mục 3.2): SELECT ... FOR UPDATE attempt và xác minh Fencing
+				if currentAttempt != nil && currentAttempt.ID > 0 {
+					var lockedAttempt domain.CheckoutAttempt
+					if err := tx.Set("gorm:query_option", "FOR UPDATE").
+						Where("id = ?", currentAttempt.ID).First(&lockedAttempt).Error; err != nil {
+						return fmt.Errorf("FENCING_ERROR: không thể khóa attempt: %w", err)
+					}
+					if lockedAttempt.Status != domain.CheckoutAttemptStatusPending {
+						return fmt.Errorf("FENCING_LOST: attempt status là %s, kỳ vọng PENDING", lockedAttempt.Status)
+					}
+					if lockedAttempt.OwnerToken != workerOwnerToken {
+						return errors.New("FENCING_LOST: owner_token không trùng khớp, worker khác đã takeover")
+					}
+					if lockedAttempt.Version != currentAttempt.Version {
+						return fmt.Errorf("FENCING_LOST: attempt version %d đã bị thay đổi thành %d", currentAttempt.Version, lockedAttempt.Version)
+					}
+				}
+
+				// Bước 3 (Mục 3.2): Campaign Lifecycle Synchronization: Lấy SHARE lock trên các campaigns tham gia
+				if len(reservedList) > 0 && s.fsRepo != nil {
+					var campIDs []uint
+					campSeen := make(map[uint]bool)
+					for _, rev := range reservedList {
+						if !campSeen[rev.campaignID] {
+							campSeen[rev.campaignID] = true
+							campIDs = append(campIDs, rev.campaignID)
+						}
+					}
+					sort.Slice(campIDs, func(i, j int) bool { return campIDs[i] < campIDs[j] })
+					lockedCamps, err := s.fsRepo.GetCampaignsForShare(tx, campIDs)
+					if err != nil {
+						return fmt.Errorf("lỗi kiểm tra trạng thái chiến dịch Flash Sale: %w", err)
+					}
+					if len(lockedCamps) != len(campIDs) {
+						return errors.New("CAMPAIGN_NOT_FOUND: Một số chiến dịch Flash Sale không tồn tại")
+					}
+					for _, lc := range lockedCamps {
+						if lc.Status != domain.CampaignStatusActive {
+							return fmt.Errorf("CAMPAIGN_ENDED: Chiến dịch Flash Sale '%s' đã kết thúc hoặc không còn hoạt động (hiện tại: %s)", lc.Name, lc.Status)
+						}
+					}
+				}
+
+				// Bước 4 (Mục 3.2): Tạo đơn hàng gắn CheckoutAttemptID và chi tiết
+				if currentAttempt != nil && currentAttempt.ID > 0 {
+					order.CheckoutAttemptID = &currentAttempt.ID
+				}
 				if err := tx.Create(order).Error; err != nil {
 					return fmt.Errorf("lỗi tạo đơn hàng: %w", err)
 				}
@@ -633,24 +1121,69 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 					}
 				}
 
+				// Bước 5 (Mục 3.2 & R1): Cập nhật CheckoutAttempt thành COMPLETED trong cùng Transaction có Fencing check
+				if req.IdempotencyKey != "" {
+					respObj := s.toOrderResponse(order)
+					respData, _ := json.Marshal(respObj)
+					if currentAttempt != nil && currentAttempt.ID > 0 {
+						if err := s.orderRepo.CompleteAttemptInTx(tx, currentAttempt.ID, currentAttempt.Version, order.ID, order.OrderCode, string(respData)); err != nil {
+							return fmt.Errorf("lỗi cập nhật checkout_attempt: %w", err)
+						}
+					} else {
+						attemptRecord := &domain.CheckoutAttempt{
+							UserID:             userID,
+							IdempotencyKey:     req.IdempotencyKey,
+							RequestFingerprint: requestFingerprint,
+							FingerprintVersion: CanonicalFingerprintVersion,
+							Status:             domain.CheckoutAttemptStatusCompleted,
+							OrderID:            &order.ID,
+							OrderCode:          order.OrderCode,
+							ResponsePayload:    string(respData),
+							CreatedAt:          now,
+							UpdatedAt:          now,
+						}
+						if err := tx.Create(attemptRecord).Error; err != nil {
+							return fmt.Errorf("lỗi ghi checkout_attempt: %w", err)
+						}
+					}
+				}
+
 				return nil
 			})
-		} else {
-			txErr = s.orderRepo.CreateOrder(order)
 		}
 
 		if txErr != nil {
-			for _, rev := range reservedList {
-				if s.redisClient != nil {
-					_, _ = redislock.ReleaseFlashSaleReservation(ctx, s.redisClient, rev.campaignID, rev.productID, rev.reservationID, "CANCELLED")
+			// R4: Outcome Resolution - Phân giải outcome trước khi giải phóng Redis
+			orderResp, resolved := s.resolveCommitOutcome(ctx, currentAttempt, workerOwnerToken, reservedList)
+			if resolved {
+				if orderResp != nil {
+					return orderResp, nil
 				}
+				logger.ErrorContext(ctx, "Lỗi tạo đơn hàng trong Transaction (đã phân giải rollback và dọn dẹp)", "error", txErr.Error())
+				return nil, fmt.Errorf("không thể tạo đơn hàng: %w", txErr)
 			}
-			logger.ErrorContext(ctx, "Lỗi tạo đơn hàng trong Transaction", "error", txErr.Error())
-			return nil, fmt.Errorf("không thể tạo đơn hàng: %w", txErr)
+			logger.ErrorContext(ctx, "Commit outcome chưa xác định (DB timeout / network partition)", "error", txErr.Error())
+			return nil, errors.New("CHECKOUT_OUTCOME_UNKNOWN: Trạng thái đơn hàng chưa được xác định. Vui lòng kiểm tra lại sau ít phút")
 		}
 
-		if req.FromCart && cart != nil {
-			_ = s.cartRepo.ClearCart(cart.ID)
+		if s.cartRepo != nil && req.FromCart {
+			// Section 6.3: Dọn giỏ hàng theo quantity delta snapshot, bảo toàn các món khách thêm sau
+			latestCart, err := s.cartRepo.GetCartByUserID(userID)
+			if err == nil && latestCart != nil && len(latestCart.Items) > 0 {
+				for _, orderItem := range orderItems {
+					for _, cartItem := range latestCart.Items {
+						if cartItem.ProductID == orderItem.ProductID {
+							remainingQty := cartItem.Quantity - orderItem.Quantity
+							if remainingQty <= 0 {
+								_ = s.cartRepo.RemoveItem(latestCart.ID, cartItem.ID)
+							} else {
+								_ = s.cartRepo.UpdateItemQuantity(latestCart.ID, cartItem.ID, remainingQty)
+							}
+							break
+						}
+					}
+				}
+			}
 		}
 
 		if len(regularItems) > 0 {
@@ -667,228 +1200,9 @@ func (s *orderService) CreateOrder(ctx context.Context, userID string, req *dto.
 		return s.toOrderResponse(order), nil
 	}
 
-	// Đơn hàng thông thường 100%
-	deductedItems, err := s.deductStockWithRedis(ctx, orderItems)
-	if err != nil {
-		return nil, err
-	}
-
-	order := &domain.Order{
-		OrderCode:       orderCode,
-		UserID:          userID,
-		CustomerName:    req.CustomerName,
-		CustomerEmail:   req.CustomerEmail,
-		CustomerPhone:   req.CustomerPhone,
-		ShippingAddress: req.ShippingAddress,
-		Note:            req.Note,
-		PaymentMethod:   req.PaymentMethod,
-		PaymentStatus:   domain.PaymentStatusPending,
-		OrderStatus:     domain.OrderStatusPending,
-		TotalAmount:     totalAmount,
-		Items:           orderItems,
-	}
-
-	if err := s.orderRepo.CreateOrder(order); err != nil {
-		s.rollbackDeductedStock(ctx, deductedItems)
-		logger.ErrorContext(ctx, "Lỗi tạo đơn hàng trong PostgreSQL, đã hoàn lại tồn kho Redis", "error", err.Error())
-		return nil, errors.New("không thể tạo đơn hàng, vui lòng thử lại sau")
-	}
-
-	if req.FromCart && cart != nil {
-		_ = s.cartRepo.ClearCart(cart.ID)
-	}
-
-	var eventItems []pkgKafka.OrderItemPayload
-	for _, item := range order.Items {
-		eventItems = append(eventItems, pkgKafka.OrderItemPayload{
-			ProductID:   item.ProductID,
-			ProductName: item.ProductName,
-			ProductSlug: item.ProductSlug,
-			Thumbnail:   item.Thumbnail,
-			Price:       item.Price,
-			Quantity:    item.Quantity,
-			Subtotal:    item.Subtotal,
-		})
-	}
-
-	if s.kafkaProducer != nil {
-		_ = s.kafkaProducer.PublishOrderCreated(ctx, pkgKafka.OrderCreatedPayload{
-			EventType:       pkgKafka.EventOrderCreated,
-			OrderID:         order.ID,
-			OrderCode:       order.OrderCode,
-			UserID:          order.UserID,
-			CustomerEmail:   order.CustomerEmail,
-			CustomerName:    order.CustomerName,
-			CustomerPhone:   order.CustomerPhone,
-			ShippingAddress: order.ShippingAddress,
-			TotalAmount:     order.TotalAmount,
-			PaymentMethod:   order.PaymentMethod,
-			Items:           eventItems,
-			TraceID:         logger.GetTraceID(ctx),
-			CreatedAt:       order.CreatedAt,
-		})
-	}
-
-	return s.toOrderResponse(order), nil
+	return nil, errors.New("DATABASE_REQUIRED: Hệ thống đặt hàng yêu cầu kết nối cơ sở dữ liệu để thực hiện transaction")
 }
 
-// CreateFlashSaleOrderAsync tạo đơn Flash Sale siêu tốc: Trừ kho RAM -> Bắn Kafka -> Trả về 202 Accepted
-func (s *orderService) CreateFlashSaleOrderAsync(ctx context.Context, userID string, req *dto.FlashSaleOrderRequest) (*dto.FlashSaleOrderAsyncResponse, error) {
-	if req.ProductID == 0 || req.Quantity <= 0 {
-		return nil, errors.New("thông tin sản phẩm đặt mua Flash Sale không hợp lệ")
-	}
-	if req.CustomerName == "" || req.CustomerEmail == "" || req.CustomerPhone == "" || req.ShippingAddress == "" {
-		return nil, errors.New("vui lòng điền đầy đủ thông tin nhận hàng")
-	}
-
-	// 1. CHẶN ĐẦU TIÊN: Trừ tồn kho Atomic trên Redis kết hợp giới hạn 1 User / 1 Món
-	res, err := redislock.DeductFlashSaleStockAtomic(ctx, s.redisClient, req.ProductID, userID, req.Quantity)
-	if err != nil {
-		logger.ErrorContext(ctx, "Lỗi trừ tồn kho Flash Sale trên Redis", "error", err.Error())
-		return nil, fmt.Errorf("hệ thống đang quá tải, vui lòng thử lại sau")
-	}
-
-	switch res {
-	case redislock.StockResultAlreadyPurchased:
-		return nil, errors.New("bạn đã mua sản phẩm này trong đợt Flash Sale (giới hạn 1 món/người)")
-	case redislock.StockResultInsufficient:
-		return nil, errors.New("sản phẩm Flash Sale đã hết hàng hoặc không đủ tồn kho")
-	case redislock.StockResultNotFound:
-		// Chống Cache Stampede: Dùng Singleflight gọi sang Product Service nạp kho Redis
-		if s.productClient != nil {
-			sfPrewarmKey := fmt.Sprintf("prewarm_stock_%d", req.ProductID)
-			_, _, _ = s.sfGroup.Do(sfPrewarmKey, func() (interface{}, error) {
-				currentStock, sErr := redislock.GetStock(ctx, s.redisClient, req.ProductID)
-				if sErr == nil && currentStock >= 0 {
-					return nil, nil
-				}
-
-				prod, pErr := s.productClient.GetProduct(ctx, req.ProductID)
-				if pErr == nil && prod != nil && prod.Stock > 0 {
-					_ = redislock.PrewarmStock(ctx, s.redisClient, req.ProductID, prod.Stock)
-				}
-				return nil, nil
-			})
-
-			retryRes, _ := redislock.DeductFlashSaleStockAtomic(ctx, s.redisClient, req.ProductID, userID, req.Quantity)
-			if retryRes == redislock.StockResultSuccess {
-				goto winnerFound
-			}
-			if retryRes == redislock.StockResultAlreadyPurchased {
-				return nil, errors.New("bạn đã mua sản phẩm này trong đợt Flash Sale (giới hạn 1 món/người)")
-			}
-		}
-		return nil, errors.New("sản phẩm Flash Sale chưa sẵn sàng hoặc đã hết hàng")
-	}
-
-winnerFound:
-	// 2. CHỈ DÀNH CHO NGƯỜI THẮNG: Lấy thông tin giá từ Redis Cache hoặc ProductClient
-	var price float64
-	cacheKey := fmt.Sprintf("cache:product:%d", req.ProductID)
-
-	if s.redisClient != nil {
-		cachedJSON, cErr := s.redisClient.Get(ctx, cacheKey).Result()
-		if cErr == nil && cachedJSON != "" {
-			var cachedProd dto.ProductDetailResponse
-			if err := json.Unmarshal([]byte(cachedJSON), &cachedProd); err == nil {
-				if cachedProd.DiscountPrice > 0 {
-					price = cachedProd.DiscountPrice
-				} else {
-					price = cachedProd.Price
-				}
-			}
-		}
-	}
-
-	if price == 0 && s.productClient != nil {
-		sfKey := fmt.Sprintf("flash_sale_prod_%d", req.ProductID)
-		v, sfErr, _ := s.sfGroup.Do(sfKey, func() (interface{}, error) {
-			prod, err := s.productClient.GetProduct(ctx, req.ProductID)
-			if err != nil || prod == nil {
-				return float64(1000000), err
-			}
-			p := prod.Price
-			if prod.DiscountPrice > 0 {
-				p = prod.DiscountPrice
-			}
-			return p, nil
-		})
-		if sfErr == nil && v != nil {
-			price = v.(float64)
-		}
-	}
-	if price == 0 {
-		price = 1000000 // Fallback an toàn
-	}
-
-	// 3. Sinh mã token theo dõi tiến độ
-	orderToken := fmt.Sprintf("FSO-%s", strings.ToUpper(uuid.New().String()))
-
-	// 4. Lưu trạng thái PENDING vào Redis RAM (TTL 15 phút)
-	initialStatus := dto.FlashSaleStatusResponse{
-		OrderToken: orderToken,
-		Status:     "PENDING",
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	statusJSON, _ := json.Marshal(initialStatus)
-	_ = redislock.SetFlashSaleOrderStatus(ctx, s.redisClient, orderToken, string(statusJSON), 15*time.Minute)
-
-	// 5. Bắn tác vụ vào Apache Kafka topic flashsale.orders để cắt đỉnh tải
-	taskPayload := pkgKafka.FlashSaleOrderTaskPayload{
-		OrderToken:      orderToken,
-		UserID:          userID,
-		ProductID:       req.ProductID,
-		Quantity:        req.Quantity,
-		Price:           price,
-		CustomerName:    req.CustomerName,
-		CustomerEmail:   req.CustomerEmail,
-		CustomerPhone:   req.CustomerPhone,
-		ShippingAddress: req.ShippingAddress,
-		PaymentMethod:   req.PaymentMethod,
-		TraceID:         logger.GetTraceID(ctx),
-		CreatedAt:       time.Now(),
-	}
-
-	if s.kafkaProducer != nil {
-		err = s.kafkaProducer.PublishFlashSaleOrderTask(ctx, taskPayload)
-		if err != nil {
-			// Rollback kho nếu không thể bắn vào Kafka
-			_ = redislock.RevertFlashSaleStockAtomic(ctx, s.redisClient, req.ProductID, userID, req.Quantity)
-			return nil, fmt.Errorf("không thể tiếp nhận đơn Flash Sale vào hàng đợi: %w", err)
-		}
-	}
-
-	logger.InfoContext(ctx, "⚡ [FLASH SALE] Tiếp nhận đơn hàng thành công vào Kafka",
-		"order_token", orderToken,
-		"user_id", userID,
-		"product_id", req.ProductID,
-	)
-
-	return &dto.FlashSaleOrderAsyncResponse{
-		OrderToken:     orderToken,
-		Status:         "PENDING",
-		Message:        "Đơn hàng Flash Sale đang được xử lý trong hàng đợi Kafka",
-		CheckStatusURL: fmt.Sprintf("/orders/flash-sale/status/%s", orderToken),
-	}, nil
-}
-
-// GetFlashSaleOrderStatus kiểm tra trạng thái đơn hàng trực tiếp từ RAM Redis (Zero DB Hit)
-func (s *orderService) GetFlashSaleOrderStatus(ctx context.Context, token string) (*dto.FlashSaleStatusResponse, error) {
-	val, err := redislock.GetFlashSaleOrderStatus(ctx, s.redisClient, token)
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return nil, errors.New("mã đơn hàng Flash Sale không tồn tại hoặc đã hết hạn")
-		}
-		return nil, fmt.Errorf("lỗi tra cứu trạng thái: %w", err)
-	}
-
-	var resp dto.FlashSaleStatusResponse
-	if err := json.Unmarshal([]byte(val), &resp); err != nil {
-		return nil, fmt.Errorf("lỗi đọc dữ liệu trạng thái: %w", err)
-	}
-
-	return &resp, nil
-}
 
 // PrewarmStock nạp trước số lượng tồn kho Flash Sale lên RAM Redis
 func (s *orderService) PrewarmStock(ctx context.Context, productID uint, stock int) error {
@@ -986,66 +1300,6 @@ func (s *orderService) toOrderResponse(order *domain.Order) *dto.OrderResponse {
 		TotalAmount:     order.TotalAmount,
 		Items:           itemResponses,
 		CreatedAt:       order.CreatedAt.Format("02/01/2006 15:04:05"),
-	}
-}
-
-func (s *orderService) deductStockWithRedis(ctx context.Context, items []domain.OrderItem) ([]domain.OrderItem, error) {
-	if s.redisClient == nil {
-		return nil, nil
-	}
-
-	var deductedItems []domain.OrderItem
-
-	for _, item := range items {
-		result, err := redislock.DeductStockAtomic(ctx, s.redisClient, item.ProductID, item.Quantity)
-		if err != nil {
-			s.rollbackDeductedStock(ctx, deductedItems)
-			return nil, fmt.Errorf("lỗi kết nối Redis khi kiểm tra tồn kho: %w", err)
-		}
-
-		switch result {
-		case redislock.StockResultSuccess:
-			deductedItems = append(deductedItems, item)
-
-		case redislock.StockResultInsufficient:
-			s.rollbackDeductedStock(ctx, deductedItems)
-			return nil, fmt.Errorf("sản phẩm '%s' đã hết hàng hoặc không đủ tồn kho", item.ProductName)
-
-		case redislock.StockResultNotFound:
-			if s.productClient != nil {
-				prod, err := s.productClient.GetProduct(ctx, item.ProductID)
-				if err != nil || prod == nil {
-					s.rollbackDeductedStock(ctx, deductedItems)
-					return nil, fmt.Errorf("sản phẩm #%d không tồn tại", item.ProductID)
-				}
-
-				if prod.Stock < item.Quantity {
-					_ = redislock.SetStock(ctx, s.redisClient, item.ProductID, prod.Stock)
-					s.rollbackDeductedStock(ctx, deductedItems)
-					return nil, fmt.Errorf("sản phẩm '%s' đã hết hàng trong kho", prod.Name)
-				}
-
-				_ = redislock.SetStock(ctx, s.redisClient, item.ProductID, prod.Stock)
-				retryRes, retryErr := redislock.DeductStockAtomic(ctx, s.redisClient, item.ProductID, item.Quantity)
-				if retryErr != nil || retryRes != redislock.StockResultSuccess {
-					s.rollbackDeductedStock(ctx, deductedItems)
-					return nil, fmt.Errorf("sản phẩm '%s' đã hết hàng hoặc không đủ tồn kho", item.ProductName)
-				}
-
-				deductedItems = append(deductedItems, item)
-			}
-		}
-	}
-
-	return deductedItems, nil
-}
-
-func (s *orderService) rollbackDeductedStock(ctx context.Context, items []domain.OrderItem) {
-	if s.redisClient == nil || len(items) == 0 {
-		return
-	}
-	for _, item := range items {
-		_ = redislock.RevertStockAtomic(ctx, s.redisClient, item.ProductID, item.Quantity)
 	}
 }
 

@@ -7,10 +7,9 @@ import {
   AdminCampaignItem,
   AdminCampaignListResponse,
   AdminCreateCampaignPayload,
+  AdminUpdateCampaignPayload,
+  AdminUpdateCampaignItemPayload,
   BatchOfferResponse,
-  CreateFlashSaleOrderPayload,
-  FlashSaleOrderStatus,
-  FlashSaleReservationResponse,
   ProductOfferResponse,
 } from "../types";
 
@@ -48,57 +47,6 @@ export const flashSaleService = {
     });
   },
 
-  /**
-   * Khách hàng đặt mua Flash Sale qua Hot Path (kèm header Idempotency-Key UUID v4)
-   */
-  async reserveOrder(
-    campaignId: number,
-    productId: number,
-    payload: CreateFlashSaleOrderPayload,
-    idempotencyKey?: string
-  ): Promise<ApiResponse<FlashSaleReservationResponse>> {
-    const key =
-      idempotencyKey ||
-      (typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `fs-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`);
-
-    return apiClient<ApiResponse<FlashSaleReservationResponse>>(
-      `/flash-sales/${campaignId}/items/${productId}/orders`,
-      {
-        method: "POST",
-        headers: {
-          "Idempotency-Key": key,
-        },
-        body: JSON.stringify(payload),
-      }
-    );
-  },
-
-  /**
-   * Polling kiểm tra trạng thái đơn hàng từ RAM Redis
-   */
-  async getOrderStatus(
-    reservationId: string
-  ): Promise<ApiResponse<FlashSaleOrderStatus>> {
-    return apiClient<ApiResponse<FlashSaleOrderStatus>>(
-      `/flash-sales/orders/${reservationId}`,
-      {
-        method: "GET",
-      }
-    );
-  },
-
-  /**
-   * Mở kết nối Server-Sent Events (SSE) để nhận kết quả xác nhận đơn hàng realtime
-   */
-  createOrderStatusEventSource(reservationId: string): EventSource | null {
-    if (typeof window === "undefined" || !window.EventSource) {
-      return null;
-    }
-    const url = `${API_BASE_URL}/flash-sales/orders/${reservationId}/stream`;
-    return new EventSource(url);
-  },
 
   // ==================== ADMIN APIS ====================
 
@@ -149,6 +97,51 @@ export const flashSaleService = {
       {
         method: "POST",
         body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Cập nhật thông tin chiến dịch Flash Sale (Tên, mô tả, giờ bắt đầu/kết thúc)
+   */
+  async updateCampaign(
+    campaignId: number,
+    payload: AdminUpdateCampaignPayload
+  ): Promise<ApiResponse<AdminCampaign>> {
+    return apiClient<ApiResponse<AdminCampaign>>(`/admin/flash-sales/${campaignId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  /**
+   * Cập nhật thông tin sản phẩm trong chiến dịch (giá sale, giá gốc, kho, quota)
+   */
+  async updateCampaignItem(
+    campaignId: number,
+    itemId: number,
+    payload: AdminUpdateCampaignItemPayload
+  ): Promise<ApiResponse<AdminCampaignItem>> {
+    return apiClient<ApiResponse<AdminCampaignItem>>(
+      `/admin/flash-sales/${campaignId}/items/${itemId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  /**
+   * Xóa sản phẩm khỏi chiến dịch Flash Sale (khi ở DRAFT)
+   */
+  async deleteCampaignItem(
+    campaignId: number,
+    itemId: number
+  ): Promise<ApiResponse<null>> {
+    return apiClient<ApiResponse<null>>(
+      `/admin/flash-sales/${campaignId}/items/${itemId}`,
+      {
+        method: "DELETE",
       }
     );
   },

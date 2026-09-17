@@ -35,6 +35,7 @@ func setupMixedTestDB(t *testing.T) (*gorm.DB, *miniredis.Miniredis, *redis.Clie
 		&domain.OutboxEvent{},
 		&domain.Cart{},
 		&domain.CartItem{},
+		&domain.CheckoutAttempt{},
 	)
 	assert.NoError(t, err)
 

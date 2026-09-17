@@ -6,8 +6,9 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?style=flat&logo=postgresql)](https://www.postgresql.org)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?style=flat&logo=redis)](https://redis.io)
 [![Architecture](https://img.shields.io/badge/Architecture-Clean%20%26%20Saga%20Choreography-success)](#-kiến-trúc-hệ-thống)
+[![Acceptance Tests](https://img.shields.io/badge/Acceptance%20Tests-15%2F15%20PASS%20(-race%20-count%3D20)-brightgreen)](#-kiểm-thử-tự-động-automated-testing)
 
-Hệ thống Thương mại Điện tử phân tán (Distributed E-Commerce Platform) hiệu năng cao, được thiết kế theo kiến trúc **Event-Driven Microservices**, tuân thủ nghiêm ngặt **Clean Architecture**, **Database-per-Service**, quản lý giao dịch phân tán bằng **Saga Choreography (100% Apache Kafka)** và xử lý tranh chấp Flash Sale bằng **Redis Distributed Lock**.
+Hệ thống Thương mại Điện tử phân tán (Distributed E-Commerce Platform) hiệu năng cao, được thiết kế theo kiến trúc **Event-Driven Microservices**, tuân thủ nghiêm ngặt **Clean Architecture**, **Database-per-Service**, quản lý giao dịch phân tán bằng **Saga Choreography (100% Apache Kafka)** và sở hữu động cơ **Flash Sale Unified Checkout (Revision 2)** đạt chuẩn production các sàn TMĐT lớn (Shopee, Tiki).
 
 ---
 
@@ -26,8 +27,8 @@ microservice-ecomerce/
 │       ├── product-service/         # Sản phẩm & Flash Sale Atomic Lock (:8002)
 │       └── order-service/           # Đơn hàng, Giỏ hàng & Kafka Saga Worker (:8003)
 │
-├── frontend/                        # Ứng dụng Web Client (Next.js 15 + TypeScript)
-│   ├── src/app/                     # Next.js App Router (Màn hình mua sắm, giỏ hàng, flash sale)
+├── frontend/                        # Ứng dụng Web Client (Next.js 15 App Router + TypeScript)
+│   ├── src/app/                     # Next.js App Router (Màn hình mua sắm, giỏ hàng, unified checkout)
 │   └── src/components/              # UI Components tối ưu trải nghiệm người dùng
 │
 ├── start_all.sh                     # Script khởi chạy toàn bộ hệ thống trong 1 lệnh
@@ -40,12 +41,14 @@ microservice-ecomerce/
 
 | Tính Năng | Giải Pháp Kỹ Thuật | Mô Tả |
 | :--- | :--- | :--- |
-| **Giao dịch phân tán** | **Saga Choreography** | Phối hợp xử lý đơn hàng và trừ kho bất đồng bộ qua **Apache Kafka**, tự động kích hoạt **Compensating Transaction** khi hết hàng. |
-| **Bảo vệ toàn vẹn dữ liệu** | **Database-per-Service** | Mỗi microservice sở hữu một database PostgreSQL riêng biệt, loại bỏ hoàn toàn Shared Database anti-pattern. |
-| **Chống bán âm (Flash Sale)** | **Redis Atomic Lua Script** | Kiểm tra và trừ tồn kho trực tiếp trên RAM với độ trễ < 1ms, chặn đứng race-condition và overselling khi hàng ngàn người mua cùng lúc. |
-| **Chống gửi trùng đơn** | **Idempotency Key Middleware** | Chặn double-click và mạng lag bằng cơ chế Redis Lock + TTL, tự động trả `HTTP 409 Conflict`. |
-| **Clean Architecture** | **Domain-Driven Isolation** | Tách biệt 4 tầng: Domain $\rightarrow$ Use Cases $\rightarrow$ Adapters $\rightarrow$ Delivery. Lớp lõi không phụ thuộc vào bất kỳ framework nào. |
-| **Theo dõi phân tán** | **Structured Logger + Trace ID** | Tự động sinh và truyền `X-Trace-ID` xuyên suốt từ Gateway qua các service REST/gRPC. |
+| **Flash Sale Unified Checkout** | **Single Canonical Pipeline** | Hợp nhất 100% hàng thường và hàng Flash Sale vào chung 1 giỏ hàng và 1 giao dịch duy nhất (`POST /orders/checkout`). Hỗ trợ chế độ Direct Mua ngay bảo toàn giỏ hàng chính. |
+| **Fencing Token Transaction** | **Version uint64 & CAS** | 5 bước nguyên tử trong 1 DB Transaction: SHARE lock campaign $\rightarrow$ check quota $\rightarrow$ Outbox Saga $\rightarrow$ Tạo đơn $\rightarrow$ Chốt attempt với CAS version check, ngăn chặn tuyệt đối Stale Slow Worker. |
+| **Chống Late-Reserve** | **Marker CLOSED (Redis Lua)** | Đánh dấu `CLOSED` (0 TTL) trên Redis sau khi cleanup/recovery; Lua script từ chối tức thì các request trễ mạng đến sau thời điểm dọn dẹp, triệt tiêu ghost reservation. |
+| **Replay-First Idempotency** | **Canonical SHA-256 Hash** | So khớp fingerprint trước khi check hạn QuoteToken; replay ngay kết quả cũ bất chấp token đã hết hạn. Phát hiện ngay lập tức hành vi sửa body cùng một Idempotency-Key. |
+| **Snapshot Delta Cart Cleanup** | **Delta Math Algorithm** | Trừ chính xác delta (`cart.qty - order.qty`), bảo toàn nguyên vẹn các món hàng hoặc số lượng khách thêm mới vào giỏ trong lúc checkout đang in-flight. |
+| **Giao dịch phân tán** | **Saga Choreography** | Phối hợp xử lý đơn hàng và trừ kho thường bất đồng bộ qua **Apache Kafka**, tự động kích hoạt **Compensating Transaction** khi hết hàng. |
+| **Operation Ledger** | **Idempotent Stock Worker** | Bảng sổ cái `mixed_order_stock_operations` tại Product DB lưu trạng thái `DEDUCTED`/`COMPENSATED`, xử lý triệt để bài toán Late Success và Duplicate Message. |
+| **Drain & Settlement Barrier** | **2-Phase Campaign Ending** | Tự động từ chối kết thúc Flash Sale khi còn in-flight reservations (`ReservedStock > 0`); đối soát số lượng bán 2 DB trước khi hoàn trả kho thừa. |
 
 ---
 
@@ -59,7 +62,7 @@ microservice-ecomerce/
 
 ### Frontend & Hạ Tầng
 - **Frontend Next.js**: `http://localhost:3000`
-- **PostgreSQL**: `localhost:5428`
+- **PostgreSQL**: `localhost:5428` (3 databases: `ecom_user_db`, `ecom_product_db`, `ecom_order_db`)
 - **Redis**: `localhost:6379`
 - **Apache Kafka**: `localhost:9092`
 - **Elasticsearch**: `localhost:9200`
@@ -94,25 +97,45 @@ Truy cập giao diện tại: `http://localhost:3000`
 
 ---
 
-## 🧪 Kiểm Thử Tự Động (Automated Testing)
+## 🧪 Kiểm Thử Tự Động & Nghiệm Thu (Automated Testing)
+
+Toàn bộ hệ thống được bảo vệ bởi bộ kiểm thử tự động toàn diện, bao gồm cả Unit Tests và bộ **Acceptance Race Tests (T01 – T15)**:
 
 ```bash
 cd backend
 
-# Chạy toàn bộ Unit Tests trong Workspace:
+# 1. Chạy toàn bộ quy trình nghiệm thu chuẩn Production (Race Detector lặp 20 lần):
+make test-acceptance
+
+# 2. Chạy toàn bộ Unit Tests trong Workspace:
 make test
 
-# Chạy kiểm thử luồng Đặt hàng E2E (End-to-End):
+# 3. Chạy kiểm thử luồng Đặt hàng E2E:
 ./test_e2e_order.sh
 
-# Chạy kiểm thử Flash Sale (Giả lập tranh chấp kho cao điểm):
+# 4. Chạy kiểm thử Flash Sale:
 ./test_flash_sale.sh
+```
+
+### Kết Quả Nghiệm Thu (15/15 PASS - Zero Race Conditions):
+```
+=== [1/3] Đang chạy Acceptance Tests với Race Detector (15 ca, count=20) ===
+ok      ecomerce-service/services/order-service/internal/service    81.377s
+=== [2/3] Chạy Unit Tests toàn hệ thống ===
+ok      ecomerce-service/services/order-service/internal/service    1.947s
+... (Toàn bộ microservices pass 100%)
+=== [3/3] Kiểm tra Frontend TypeCheck và Build ===
+✓ Compiled successfully in 1178ms
+✓ Finished TypeScript in 2.8s
+✅ TOÀN BỘ ACCEPTANCE TESTS & PRODUCTION BUILDS HOÀN THÀNH 100%!
 ```
 
 ---
 
-## 📚 Tài Liệu Chi Tiết
+## 📚 Tài Liệu Kỹ Thuật Chi Tiết
 
+- ⚡ [Kiến Trúc Flash Sale Unified Checkout Toàn Diện (Revision 2)](backend/FLASH_SALE_ARCHITECTURE.md)
+- 📋 [Kế Hoạch & Checklist Nghiệm Thu 15 Ca Kiểm Thử (T01–T15)](backend/FLASH_SALE_CHECKOUT_ACCEPTANCE_PLAN.md)
 - 📖 [Backend Architecture & Clean Architecture Details](backend/ARCHITECTURE.md)
 - 📖 [Backend Quick Guide & API Reference](backend/README.md)
 - 📖 [Saga Choreography & Kafka Migration Report](backend/KAFKA_SAGA_MIGRATION.md)

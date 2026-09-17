@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -84,10 +83,6 @@ func StockKey(productID uint) string {
 
 func FlashSaleUserSetKey(productID uint) string {
 	return fmt.Sprintf("flash_sale:users:%d", productID)
-}
-
-func FlashSaleOrderTokenKey(token string) string {
-	return fmt.Sprintf("flash_sale:order:%s", token)
 }
 
 // DeductStockAtomic trừ tồn kho an toàn tuyệt đối chống bán âm bằng Redis Lua Script
@@ -190,24 +185,4 @@ func GetStock(ctx context.Context, rdb *redis.Client, productID uint) (int, erro
 	}
 
 	return strconv.Atoi(val)
-}
-
-// SetFlashSaleOrderStatus lưu trạng thái đơn hàng bất đồng bộ vào Redis
-func SetFlashSaleOrderStatus(ctx context.Context, rdb *redis.Client, token string, statusData string, ttl time.Duration) error {
-	if rdb == nil {
-		return fmt.Errorf("redis client nil")
-	}
-
-	key := FlashSaleOrderTokenKey(token)
-	return rdb.Set(ctx, key, statusData, ttl).Err()
-}
-
-// GetFlashSaleOrderStatus đọc trạng thái đơn hàng từ Redis RAM
-func GetFlashSaleOrderStatus(ctx context.Context, rdb *redis.Client, token string) (string, error) {
-	if rdb == nil {
-		return "", fmt.Errorf("redis client nil")
-	}
-
-	key := FlashSaleOrderTokenKey(token)
-	return rdb.Get(ctx, key).Result()
 }

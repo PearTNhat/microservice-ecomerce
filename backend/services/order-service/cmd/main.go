@@ -69,6 +69,7 @@ func main() {
 		&domain.FlashSaleReservation{},
 		&domain.OutboxEvent{},
 		&domain.ProcessedEvent{},
+		&domain.CheckoutAttempt{},
 	)
 	if err != nil {
 		logger.Error("❌ Lỗi AutoMigrate Order/FlashSale", "error", err.Error())

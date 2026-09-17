@@ -88,14 +88,19 @@ sequenceDiagram
 
 ---
 
-## 🛡 4. Cơ Chế Chống Race Condition & Idempotency
+## 🛡 4. Cơ Chế Chống Race Condition & Idempotency (Unified Checkout Revision 2)
 
-1. **Idempotency Key (`pkg/middlewares/idempotency_middleware.go`)**:
-   - Chặn người dùng double-click hoặc mạng lag gửi trùng request đặt hàng bằng Redis Lock + TTL.
-   - Request trùng lặp trả về ngay `HTTP 409 Conflict`.
-2. **Flash Sale Atomic Lock (`pkg/redislock/redis_stock_lock.go`)**:
-   - Sử dụng Redis Lua Script nguyên tử để trừ tồn kho trên RAM với tốc độ hàng chục nghìn req/s.
-   - Giới hạn 1 người chỉ được mua 1 sản phẩm flash sale, chống overselling (bán âm kho).
+1. **Replay-First Idempotency & Canonical Fingerprint (SHA-256)**:
+   - Tra cứu `checkout_attempts` và so khớp fingerprint trước khi kiểm tra hạn của `QuoteToken`.
+   - Nếu đơn hàng đã hoàn tất (`COMPLETED`): Replay ngay kết quả cũ mà không bị chặn bởi quote token expired.
+   - Băm SHA-256 chuẩn hóa giỏ hàng và thông tin giao hàng để phát hiện ngay hành vi cố tình sửa body nhưng gửi trùng Idempotency-Key.
+2. **Transaction Fencing 5 Bước & CAS State Machine**:
+   - Khóa `FOR SHARE` campaign $\rightarrow$ Kiểm tra quota $\rightarrow$ Ghi Outbox Saga $\rightarrow$ Tạo đơn $\rightarrow$ Chốt attempt với CAS Version check.
+   - Ngăn chặn triệt để Stale Slow Worker ghi đè kết quả khi lease bị quá hạn.
+3. **Marker `CLOSED` Trên Redis Lua Script**:
+   - Đánh dấu `CLOSED` (0 TTL) trên Redis sau khi cleanup/recovery; Lua script từ chối tức thì các request trễ mạng sau 120s, triệt tiêu ghost reservation.
+4. **Snapshot Delta Cart Cleanup**:
+   - Dọn giỏ hàng theo quantity delta (`cart.qty - order.qty`), bảo toàn chính xác các sản phẩm mà khách hàng thêm mới trong lúc request checkout đang in-flight.
 
 ---
 
@@ -132,19 +137,26 @@ tail -f logs/order-service.log
 
 ## 🧪 6. Kiểm Thử Hệ Thống (Automated Testing)
 
-### 1. Chạy toàn bộ Unit Tests trong Workspace:
+### 1. Chạy toàn bộ 15 ca Nghiệm Thu (Acceptance Tests) với Race Detector (count=20):
+```bash
+make test-acceptance
+# Hoặc chạy trực tiếp:
+go test -tags=acceptance -race -count=20 ./services/order-service/internal/service -run="TestAcceptance_"
+```
+
+### 2. Chạy toàn bộ Unit Tests trong Workspace:
 ```bash
 make test
 # Hoặc:
 go test ./services/api-gateway/... ./services/user-service/... ./services/product-service/... ./services/order-service/... ./pkg/...
 ```
 
-### 2. Chạy E2E Test (Luồng Đăng ký -> Đăng nhập -> Xem sản phẩm -> Giỏ hàng -> Đặt hàng -> Idempotency Lock):
+### 3. Chạy E2E Test (Luồng Đăng ký -> Đăng nhập -> Xem sản phẩm -> Giỏ hàng -> Đặt hàng -> Idempotency Lock):
 ```bash
 ./test_e2e_order.sh
 ```
 
-### 3. Chạy Flash Sale Test (Giả lập tranh chấp kho cao điểm):
+### 4. Chạy Flash Sale Test (Giả lập tranh chấp kho cao điểm):
 ```bash
 ./test_flash_sale.sh
 ```

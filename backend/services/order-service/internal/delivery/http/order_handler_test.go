@@ -15,6 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"ecomerce-service/services/order-service/internal/repository"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
@@ -63,6 +68,46 @@ func (m *mockOrderRepoForHandlerTest) UpdatePaymentStatus(orderID uint, status s
 	return nil
 }
 
+func (m *mockOrderRepoForHandlerTest) GetCheckoutAttempt(userID, key string) (*domain.CheckoutAttempt, error) {
+	return nil, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) CreateCheckoutAttempt(attempt *domain.CheckoutAttempt) error {
+	return nil
+}
+
+func (m *mockOrderRepoForHandlerTest) SaveCheckoutAttempt(attempt *domain.CheckoutAttempt) error {
+	return nil
+}
+
+func (m *mockOrderRepoForHandlerTest) FindOrderByCheckoutAttemptID(attemptID uint) (*domain.Order, error) {
+	return nil, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) GetCheckoutAttemptByID(id uint) (*domain.CheckoutAttempt, error) {
+	return nil, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) CASClaimPending(attempt *domain.CheckoutAttempt) (bool, error) {
+	return true, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) CASRecoveringTakeover(id uint, expectedVersion uint64, newOwner string, newLease time.Time, recoveryTarget string) (*domain.CheckoutAttempt, bool, error) {
+	return nil, false, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) CASRenewLease(id uint, expectedVersion uint64, ownerToken string, newLease time.Time) (bool, error) {
+	return true, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) TransitionAttemptStatus(id uint, expectedVersion uint64, newStatus string, recoveryTarget string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockOrderRepoForHandlerTest) CompleteAttemptInTx(tx *gorm.DB, attemptID uint, expectedVersion uint64, orderID uint, orderCode string, responsePayload string) error {
+	return nil
+}
+
 func setupTestOrderApp(t *testing.T) (*fiber.App, string, string) {
 	secret := "test-secret-for-orders"
 	mr, err := miniredis.Run()
@@ -71,10 +116,31 @@ func setupTestOrderApp(t *testing.T) (*fiber.App, string, string) {
 	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	orderRepo := &mockOrderRepoForHandlerTest{}
+	dbName := fmt.Sprintf("file:handler_test_%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("Không thể khởi tạo sqlite: %v", err)
+	}
+	_ = db.AutoMigrate(
+		&domain.Order{},
+		&domain.OrderItem{},
+		&domain.FlashSaleCampaign{},
+		&domain.FlashSaleItem{},
+		&domain.FlashSaleReservation{},
+		&domain.OutboxEvent{},
+		&domain.Cart{},
+		&domain.CartItem{},
+		&domain.CheckoutAttempt{},
+	)
+	orderRepo := repository.NewOrderRepository(db)
+	cartRepo := repository.NewCartRepository(db)
+	fsRepo := repository.NewFlashSaleRepository(db)
 	producer := kafka.NewNoopOrderKafkaProducer()
 
-	orderSvc := service.NewOrderService(orderRepo, nil, nil, rdb, producer, testQuoteSecret)
+	orderSvc := service.NewOrderService(orderRepo, cartRepo, nil, rdb, producer, testQuoteSecret)
+	orderSvc.(interface {
+		SetFlashSale(*gorm.DB, domain.FlashSaleRepository)
+	}).SetFlashSale(db, fsRepo)
 
 	app := fiber.New()
 	rh := &server.RestHandler{

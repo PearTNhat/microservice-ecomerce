@@ -117,9 +117,12 @@ type ProcessedEvent struct {
 type FlashSaleRepository interface {
 	CreateCampaign(campaign *FlashSaleCampaign) error
 	GetCampaignByID(id uint) (*FlashSaleCampaign, error)
+	UpdateCampaign(campaign *FlashSaleCampaign) error
 	UpdateCampaignStatus(id uint, fromStatus CampaignStatus, toStatus CampaignStatus) error
 	ListCampaigns(status string, page int, limit int) ([]*FlashSaleCampaign, int64, error)
 	AddItem(item *FlashSaleItem) error
+	UpdateItem(item *FlashSaleItem) error
+	DeleteItem(campaignID uint, itemID uint) error
 	GetItem(campaignID uint, productID uint) (*FlashSaleItem, error)
 	GetItemByID(id uint) (*FlashSaleItem, error)
 	GetActiveCampaign() (*FlashSaleCampaign, error)
@@ -132,6 +135,8 @@ type FlashSaleRepository interface {
 	ConfirmReservationDB(tx *gorm.DB, reservationID string, orderID uint) error
 	ConfirmReservationAndCreateOrder(tx *gorm.DB, inputEventID string, order *Order, reservationID string, outboxEvents []*OutboxEvent) error
 	ReleaseReservationDB(tx *gorm.DB, reservationID string, newStatus ReservationStatus) error
+	GetCampaignsForShare(tx *gorm.DB, campaignIDs []uint) ([]*FlashSaleCampaign, error)
+	TransitionToEnding(campaignID uint) (*FlashSaleCampaign, error)
 }
 
 type OutboxRepository interface {

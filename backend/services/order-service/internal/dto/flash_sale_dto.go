@@ -9,8 +9,24 @@ type CreateCampaignRequest struct {
 	EndsAt      time.Time `json:"ends_at"`
 }
 
+type UpdateCampaignRequest struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	StartsAt    time.Time `json:"starts_at"`
+	EndsAt      time.Time `json:"ends_at"`
+}
+
 type AddFlashSaleItemRequest struct {
 	ProductID           uint    `json:"product_id"`
+	SalePrice           float64 `json:"sale_price"`
+	OriginalPrice       float64 `json:"original_price"`
+	AllocatedStock      int     `json:"allocated_stock"`
+	MaxQuantityPerUser  int     `json:"max_quantity_per_user"`
+	MaxQuantityPerOrder int     `json:"max_quantity_per_order"`
+	ReservationSeconds  int     `json:"reservation_seconds"`
+}
+
+type UpdateFlashSaleItemRequest struct {
 	SalePrice           float64 `json:"sale_price"`
 	OriginalPrice       float64 `json:"original_price"`
 	AllocatedStock      int     `json:"allocated_stock"`

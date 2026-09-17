@@ -14,6 +14,9 @@ export interface CartItem {
 
 interface CartStore {
   items: CartItem[];
+  directCheckoutDraft: CartItem[] | null;
+  setDirectCheckoutDraft: (draft: CartItem[] | null) => void;
+  clearDirectCheckoutDraft: () => void;
   isOpen: boolean;
   openCart: () => void;
   closeCart: () => void;
@@ -31,6 +34,7 @@ interface CartStore {
   removeItem: (productId: number) => void;
   updateQuantity: (productId: number, quantity: number) => void;
   syncFlashSaleOffers: (offers: Record<number, ProductOfferResponse>) => void;
+  removeSnapshotItems: (orderedItems: { product_id: number; quantity: number }[]) => void;
   clearCart: () => void;
   getTotalItems: () => number;
   getTotalPrice: () => number;
@@ -41,6 +45,9 @@ export const useCartStore = create<CartStore>()(
   persist(
     (set, get) => ({
       items: [],
+      directCheckoutDraft: null,
+      setDirectCheckoutDraft: (draft) => set({ directCheckoutDraft: draft }),
+      clearDirectCheckoutDraft: () => set({ directCheckoutDraft: null }),
       isOpen: false,
       openCart: () => set({ isOpen: true }),
       closeCart: () => set({ isOpen: false }),
@@ -127,6 +134,31 @@ export const useCartStore = create<CartStore>()(
             return state;
           }
           return { items: updatedItems };
+        });
+      },
+      removeSnapshotItems: (orderedItems: { product_id: number; quantity: number }[]) => {
+        set((state) => {
+          const orderMap = new Map<number, number>();
+          for (const oi of orderedItems) {
+            orderMap.set(oi.product_id, (orderMap.get(oi.product_id) || 0) + oi.quantity);
+          }
+          const remainingItems: CartItem[] = [];
+          for (const item of state.items) {
+            const orderedQty = orderMap.get(item.product.id) || 0;
+            if (orderedQty <= 0) {
+              remainingItems.push(item);
+            } else if (item.quantity > orderedQty) {
+              remainingItems.push({
+                ...item,
+                quantity: item.quantity - orderedQty,
+              });
+              orderMap.set(item.product.id, 0);
+            } else {
+              // item.quantity <= orderedQty
+              orderMap.set(item.product.id, orderedQty - item.quantity);
+            }
+          }
+          return { items: remainingItems };
         });
       },
       clearCart: () => set({ items: [] }),

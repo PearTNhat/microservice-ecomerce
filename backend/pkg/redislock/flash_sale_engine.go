@@ -24,6 +24,7 @@ const (
 	ResultAlreadyReleased      FlashSaleResultCode = "ALREADY_RELEASED"
 	ResultInvalidState         FlashSaleResultCode = "INVALID_STATE"
 	ResultInvariantViolation   FlashSaleResultCode = "INVARIANT_VIOLATION"
+	ResultReservationClosed    FlashSaleResultCode = "RESERVATION_CLOSED"
 )
 
 type FlashSaleResponse struct {
@@ -102,6 +103,12 @@ var reserveFlashSaleStockScript = redis.NewScript(`
 			for k, v in pairs(extra) do t[k] = v end
 		end
 		return cjson.encode(t)
+	end
+
+	-- 0. Kiểm tra Marker CLOSED: Nếu reservation_id đã bị recovery đóng thì từ chối (Mục 3.3 - R1/R2/T05)
+	local resv_status = redis.call('HGET', resv_key, 'status')
+	if resv_status == 'CLOSED' then
+		return result('RESERVATION_CLOSED')
 	end
 
 	-- 1. Kiểm tra Idempotency
@@ -279,6 +286,53 @@ var releaseFlashSaleReservationScript = redis.NewScript(`
 	return result('RELEASED')
 `)
 
+// CloseOrReleaseReservationScript đóng reservationID của generation cũ một cách nguyên tử (Mục 3.3 - R1/R2/T05):
+// Nếu reservation đã tồn tại và RESERVED: giải phóng quota kho và đánh dấu CLOSED.
+// Nếu reservation chưa tồn tại (request đến muộn): ghi marker status = 'CLOSED' để reserve muộn bị từ chối.
+var closeOrReleaseReservationScript = redis.NewScript(`
+	local stock_key    = KEYS[1]
+	local reserved_key = KEYS[2]
+	local resv_key     = KEYS[3]
+	local expiry_key   = KEYS[4]
+
+	local resv_id = ARGV[1]
+
+	local function result(code)
+		return cjson.encode({ code = code })
+	end
+
+	local status = redis.call('HGET', resv_key, 'status')
+	if status == 'CLOSED' or status == 'CANCELLED' or status == 'EXPIRED' then
+		return result('ALREADY_RELEASED')
+	end
+
+	if status == 'CONFIRMED' then
+		return result('ALREADY_CONFIRMED')
+	end
+
+	if status == 'RESERVED' or status == 'PROCESSING' then
+		local user_id = redis.call('HGET', resv_key, 'user_id')
+		local qty = tonumber(redis.call('HGET', resv_key, 'quantity'))
+		if user_id and qty and qty > 0 then
+			local current = tonumber(redis.call('HGET', reserved_key, user_id) or '0')
+			if current >= qty then
+				redis.call('INCRBY', stock_key, qty)
+				local remaining = redis.call('HINCRBY', reserved_key, user_id, -qty)
+				if remaining <= 0 then
+					redis.call('HDEL', reserved_key, user_id)
+				end
+			end
+		end
+		redis.call('ZREM', expiry_key, resv_id)
+		redis.call('HSET', resv_key, 'status', 'CLOSED')
+		return result('RELEASED')
+	end
+
+	-- Nếu chưa tồn tại reservation (late-arriving request): ghi marker CLOSED
+	redis.call('HSET', resv_key, 'status', 'CLOSED')
+	return result('RELEASED')
+`)
+
 // -----------------------------------------------------------------------------
 // Go Typed Execution Helpers
 // -----------------------------------------------------------------------------
@@ -387,6 +441,42 @@ func ReleaseFlashSaleReservation(
 	}
 
 	raw, err := releaseFlashSaleReservationScript.Run(ctx, rdb, keys, reservationID, newStatus).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	jsonStr, ok := raw.(string)
+	if !ok {
+		return nil, fmt.Errorf("kết quả trả về từ Lua không phải string: %v", raw)
+	}
+
+	var resp FlashSaleResponse
+	if err := json.Unmarshal([]byte(jsonStr), &resp); err != nil {
+		return nil, fmt.Errorf("lỗi unmarshal response Lua: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// CloseOrReleaseReservation đóng reservation nguyên tử: giải phóng nếu đã giữ, hoặc ghi marker CLOSED nếu chưa có (Mục 3.3)
+func CloseOrReleaseReservation(
+	ctx context.Context,
+	rdb *redis.Client,
+	campaignID, productID uint,
+	reservationID string,
+) (*FlashSaleResponse, error) {
+	if rdb == nil {
+		return nil, fmt.Errorf("redis client nil")
+	}
+
+	keys := []string{
+		KeyStock(campaignID, productID),
+		KeyReserved(campaignID, productID),
+		KeyReservation(campaignID, productID, reservationID),
+		KeyExpiry(campaignID, productID),
+	}
+
+	raw, err := closeOrReleaseReservationScript.Run(ctx, rdb, keys, reservationID).Result()
 	if err != nil {
 		return nil, err
 	}

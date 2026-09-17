@@ -32,6 +32,10 @@ func (r *flashSaleRepository) GetCampaignByID(id uint) (*domain.FlashSaleCampaig
 	return &campaign, nil
 }
 
+func (r *flashSaleRepository) UpdateCampaign(campaign *domain.FlashSaleCampaign) error {
+	return r.db.Save(campaign).Error
+}
+
 func (r *flashSaleRepository) GetActiveCampaign() (*domain.FlashSaleCampaign, error) {
 	var campaign domain.FlashSaleCampaign
 	now := time.Now()
@@ -106,6 +110,14 @@ func (r *flashSaleRepository) ListCampaigns(status string, page int, limit int) 
 
 func (r *flashSaleRepository) AddItem(item *domain.FlashSaleItem) error {
 	return r.db.Create(item).Error
+}
+
+func (r *flashSaleRepository) UpdateItem(item *domain.FlashSaleItem) error {
+	return r.db.Save(item).Error
+}
+
+func (r *flashSaleRepository) DeleteItem(campaignID uint, itemID uint) error {
+	return r.db.Where("campaign_id = ? AND id = ?", campaignID, itemID).Delete(&domain.FlashSaleItem{}).Error
 }
 
 func (r *flashSaleRepository) GetItem(campaignID uint, productID uint) (*domain.FlashSaleItem, error) {
@@ -355,3 +367,46 @@ func (r *flashSaleRepository) ReleaseReservationDB(tx *gorm.DB, reservationID st
 	}
 	return nil
 }
+
+func (r *flashSaleRepository) GetCampaignsForShare(tx *gorm.DB, campaignIDs []uint) ([]*domain.FlashSaleCampaign, error) {
+	db := r.db
+	if tx != nil {
+		db = tx
+	}
+
+	var campaigns []*domain.FlashSaleCampaign
+	err := db.Clauses(clause.Locking{Strength: "SHARE"}).
+		Where("id IN ?", campaignIDs).
+		Order("id ASC").
+		Find(&campaigns).Error
+	if err != nil {
+		return nil, err
+	}
+	return campaigns, nil
+}
+
+func (r *flashSaleRepository) TransitionToEnding(campaignID uint) (*domain.FlashSaleCampaign, error) {
+	var camp domain.FlashSaleCampaign
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Preload("Items").Where("id = ?", campaignID).First(&camp).Error; err != nil {
+			return err
+		}
+		if camp.Status != domain.CampaignStatusActive && camp.Status != domain.CampaignStatusEnding {
+			return fmt.Errorf("chỉ có thể kết thúc campaign đang ACTIVE hoặc ENDING (hiện tại: %s)", camp.Status)
+		}
+		if camp.Status == domain.CampaignStatusActive {
+			camp.Status = domain.CampaignStatusEnding
+			camp.Version++
+			camp.UpdatedAt = time.Now()
+			if err := tx.Save(&camp).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+

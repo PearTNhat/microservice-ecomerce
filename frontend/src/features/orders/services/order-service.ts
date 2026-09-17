@@ -4,9 +4,6 @@ import {
   BasketQuoteRequest,
   BasketQuoteResponse,
   CreateOrderPayload,
-  FlashSaleAsyncResponse,
-  FlashSaleOrderPayload,
-  FlashSaleStatusResponse,
   Order,
   OrderListResponse,
 } from "../types";
@@ -54,32 +51,6 @@ export const orderService = {
       },
       body: JSON.stringify(payload),
     });
-  },
-
-  /**
-   * Đặt mua sản phẩm Flash Sale bất đồng bộ (trả về 202 Accepted + order_token)
-   */
-  async createFlashSaleOrder(
-    payload: FlashSaleOrderPayload
-  ): Promise<ApiResponse<FlashSaleAsyncResponse>> {
-    return apiClient<ApiResponse<FlashSaleAsyncResponse>>("/orders/flash-sale", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-  },
-
-  /**
-   * Polling kiểm tra trạng thái đơn hàng Flash Sale từ Redis RAM (Zero DB Hit)
-   */
-  async getFlashSaleStatus(
-    orderToken: string
-  ): Promise<ApiResponse<FlashSaleStatusResponse>> {
-    return apiClient<ApiResponse<FlashSaleStatusResponse>>(
-      `/orders/flash-sale/status/${orderToken}`,
-      {
-        method: "GET",
-      }
-    );
   },
 
   /**

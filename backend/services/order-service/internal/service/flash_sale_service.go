@@ -23,7 +23,10 @@ import (
 
 type FlashSaleService interface {
 	CreateCampaign(ctx context.Context, req *dto.CreateCampaignRequest) (*dto.FlashSaleCampaignResponse, error)
+	UpdateCampaign(ctx context.Context, campaignID uint, req *dto.UpdateCampaignRequest) (*dto.FlashSaleCampaignResponse, error)
 	AddItem(ctx context.Context, campaignID uint, req *dto.AddFlashSaleItemRequest) (*dto.FlashSaleItemResponse, error)
+	UpdateItem(ctx context.Context, campaignID, itemID uint, req *dto.UpdateFlashSaleItemRequest) (*dto.FlashSaleItemResponse, error)
+	DeleteItem(ctx context.Context, campaignID, itemID uint) error
 	ActivateCampaign(ctx context.Context, campaignID uint) error
 	EndCampaign(ctx context.Context, campaignID uint) error
 	CloneCampaign(ctx context.Context, campaignID uint) (*dto.FlashSaleCampaignResponse, error)
@@ -81,14 +84,44 @@ func (s *flashSaleService) CreateCampaign(ctx context.Context, req *dto.CreateCa
 	return s.toCampaignResponse(campaign), nil
 }
 
+func (s *flashSaleService) UpdateCampaign(ctx context.Context, campaignID uint, req *dto.UpdateCampaignRequest) (*dto.FlashSaleCampaignResponse, error) {
+	camp, err := s.repo.GetCampaignByID(campaignID)
+	if err != nil {
+		return nil, fmt.Errorf("không tìm thấy campaign #%d", campaignID)
+	}
+
+	if camp.Status != domain.CampaignStatusDraft && camp.Status != domain.CampaignStatusActivationFailed {
+		return nil, fmt.Errorf("chỉ có thể chỉnh sửa chiến dịch ở trạng thái DRAFT hoặc ACTIVATION_FAILED (hiện tại: %s). Vui lòng Nhân bản để tạo đợt mới nếu muốn thay đổi", camp.Status)
+	}
+
+	if req.Name == "" {
+		return nil, errors.New("tên chiến dịch không được để trống")
+	}
+	if req.EndsAt.Before(req.StartsAt) || req.EndsAt.Equal(req.StartsAt) {
+		return nil, errors.New("thời gian kết thúc phải sau thời gian bắt đầu")
+	}
+
+	camp.Name = req.Name
+	camp.Description = req.Description
+	camp.StartsAt = req.StartsAt
+	camp.EndsAt = req.EndsAt
+	camp.UpdatedAt = time.Now()
+
+	if err := s.repo.UpdateCampaign(camp); err != nil {
+		return nil, fmt.Errorf("lỗi cập nhật chiến dịch: %w", err)
+	}
+
+	return s.toCampaignResponse(camp), nil
+}
+
 func (s *flashSaleService) AddItem(ctx context.Context, campaignID uint, req *dto.AddFlashSaleItemRequest) (*dto.FlashSaleItemResponse, error) {
 	camp, err := s.repo.GetCampaignByID(campaignID)
 	if err != nil {
 		return nil, fmt.Errorf("không tìm thấy campaign #%d", campaignID)
 	}
 
-	if camp.Status != domain.CampaignStatusDraft {
-		return nil, errors.New("chỉ có thể thêm sản phẩm khi Campaign ở trạng thái DRAFT")
+	if camp.Status != domain.CampaignStatusDraft && camp.Status != domain.CampaignStatusActivationFailed {
+		return nil, errors.New("chỉ có thể thêm sản phẩm khi Campaign ở trạng thái DRAFT hoặc ACTIVATION_FAILED")
 	}
 
 	if req.ProductID == 0 || req.AllocatedStock <= 0 || req.SalePrice < 0 {
@@ -128,6 +161,75 @@ func (s *flashSaleService) AddItem(ctx context.Context, campaignID uint, req *dt
 	}
 
 	return s.toItemResponse(item), nil
+}
+
+func (s *flashSaleService) UpdateItem(ctx context.Context, campaignID, itemID uint, req *dto.UpdateFlashSaleItemRequest) (*dto.FlashSaleItemResponse, error) {
+	camp, err := s.repo.GetCampaignByID(campaignID)
+	if err != nil {
+		return nil, fmt.Errorf("không tìm thấy campaign #%d", campaignID)
+	}
+
+	if camp.Status != domain.CampaignStatusDraft && camp.Status != domain.CampaignStatusActivationFailed {
+		return nil, fmt.Errorf("chỉ có thể chỉnh sửa sản phẩm khi Campaign ở trạng thái DRAFT hoặc ACTIVATION_FAILED (hiện tại: %s)", camp.Status)
+	}
+
+	item, err := s.repo.GetItemByID(itemID)
+	if err != nil || item == nil || item.CampaignID != campaignID {
+		return nil, fmt.Errorf("không tìm thấy sản phẩm #%d trong chiến dịch #%d", itemID, campaignID)
+	}
+
+	if req.AllocatedStock <= 0 || req.SalePrice < 0 {
+		return nil, errors.New("giá sale và số lượng phân bổ phải lớn hơn 0")
+	}
+
+	maxPerUser := req.MaxQuantityPerUser
+	if maxPerUser < 0 {
+		maxPerUser = 1
+	}
+	maxPerOrder := req.MaxQuantityPerOrder
+	if maxPerOrder <= 0 {
+		maxPerOrder = 1
+	}
+	resvSec := req.ReservationSeconds
+	if resvSec <= 0 {
+		resvSec = 120
+	}
+
+	item.SalePrice = req.SalePrice
+	item.OriginalPrice = req.OriginalPrice
+	item.AllocatedStock = req.AllocatedStock
+	item.MaxQuantityPerUser = maxPerUser
+	item.MaxQuantityPerOrder = maxPerOrder
+	item.ReservationSeconds = resvSec
+	item.UpdatedAt = time.Now()
+
+	if err := s.repo.UpdateItem(item); err != nil {
+		return nil, fmt.Errorf("lỗi cập nhật sản phẩm: %w", err)
+	}
+
+	return s.toItemResponse(item), nil
+}
+
+func (s *flashSaleService) DeleteItem(ctx context.Context, campaignID, itemID uint) error {
+	camp, err := s.repo.GetCampaignByID(campaignID)
+	if err != nil {
+		return fmt.Errorf("không tìm thấy campaign #%d", campaignID)
+	}
+
+	if camp.Status != domain.CampaignStatusDraft && camp.Status != domain.CampaignStatusActivationFailed {
+		return fmt.Errorf("chỉ có thể xóa sản phẩm khi Campaign ở trạng thái DRAFT hoặc ACTIVATION_FAILED (hiện tại: %s)", camp.Status)
+	}
+
+	item, err := s.repo.GetItemByID(itemID)
+	if err != nil || item == nil || item.CampaignID != campaignID {
+		return fmt.Errorf("không tìm thấy sản phẩm #%d trong chiến dịch #%d", itemID, campaignID)
+	}
+
+	if err := s.repo.DeleteItem(campaignID, itemID); err != nil {
+		return fmt.Errorf("lỗi xóa sản phẩm khỏi chiến dịch: %w", err)
+	}
+
+	return nil
 }
 
 func (s *flashSaleService) ActivateCampaign(ctx context.Context, campaignID uint) error {
@@ -234,20 +336,10 @@ func (s *flashSaleService) ActivateCampaign(ctx context.Context, campaignID uint
 }
 
 func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) error {
-	camp, err := s.repo.GetCampaignByID(campaignID)
+	// 1. Chuyển sang ENDING với FOR UPDATE lock (chờ các checkout FOR SHARE in-flight commit xong)
+	camp, err := s.repo.TransitionToEnding(campaignID)
 	if err != nil {
 		return err
-	}
-
-	if camp.Status != domain.CampaignStatusActive && camp.Status != domain.CampaignStatusEnding {
-		return fmt.Errorf("chỉ có thể kết thúc campaign đang ACTIVE hoặc ENDING (hiện tại: %s)", camp.Status)
-	}
-
-	// 1. Chuyển sang ENDING nếu đang ACTIVE
-	if camp.Status == domain.CampaignStatusActive {
-		if err := s.repo.UpdateCampaignStatus(campaignID, domain.CampaignStatusActive, domain.CampaignStatusEnding); err != nil {
-			return err
-		}
 	}
 
 	// 2. Đóng cổng Redis ngay lập tức (state = ENDED) để chặn giữ chỗ mới
@@ -257,8 +349,14 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 		}
 	}
 
-	// 2.1. DRAIN BARRIER (Point 9 fix): Không được release khi còn đơn hàng/suất giữ chỗ chưa giải quyết (reserved_stock > 0)
-	for _, item := range camp.Items {
+	// 2.1. Lấy lại snapshot tươi mới của Campaign/Items sau khi các in-flight checkouts đã commit
+	freshCamp, err := s.repo.GetCampaignByID(campaignID)
+	if err != nil {
+		return err
+	}
+
+	// 2.2. DRAIN BARRIER (Point 9 fix): Không được release khi còn đơn hàng/suất giữ chỗ chưa giải quyết (reserved_stock > 0)
+	for _, item := range freshCamp.Items {
 		if item.ReservedStock > 0 {
 			return fmt.Errorf("chưa thể kết thúc campaign: sản phẩm #%d còn %d suất đang giữ chỗ (reserved_stock > 0). Vui lòng đợi các đơn hàng hỗn hợp hoàn tất hoặc hết hạn giữ chỗ",
 				item.ProductID, item.ReservedStock)
@@ -268,7 +366,7 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 	// 3. SETTLEMENT BARRIER (Hàng rào quyết toán tồn kho - Point 9 fix):
 	// Đối với từng item, kiểm tra Product DB sold_quantity đã khớp chính xác với Order DB sold_stock chưa (==).
 	// Nếu Product consumer còn đang lag phía sau (<), chờ retry. Nếu lớn hơn (>), báo lỗi bất thường sổ cái.
-	for _, item := range camp.Items {
+	for _, item := range freshCamp.Items {
 		settled := false
 		var lastProductSold int
 		for attempt := 0; attempt < 5; attempt++ {
@@ -301,7 +399,7 @@ func (s *flashSaleService) EndCampaign(ctx context.Context, campaignID uint) err
 	}
 
 	// 4. Khi toàn bộ các sản phẩm đã quyết toán đồng bộ -> Gọi ReleaseFlashSaleStock
-	for _, item := range camp.Items {
+	for _, item := range freshCamp.Items {
 		reqID := fmt.Sprintf("end-release-%d-%d", campaignID, item.ProductID)
 		if err := s.productClient.ReleaseFlashSaleStock(ctx, campaignID, item.ProductID, reqID); err != nil {
 			logger.ErrorContext(ctx, "❌ Lỗi release tồn kho cho sản phẩm",

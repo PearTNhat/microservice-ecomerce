@@ -103,23 +103,27 @@ backend/
 * **Cam Kết Sau Kết Quả Bền Vững**: Offset chỉ được commit sau khi DB transaction đã hoàn tất thành công hoặc sự kiện đã được gửi sang Dead Letter Queue (DLQ) thành công. Nếu gửi DLQ lỗi, consumer tiếp tục retry thay vì commit bỏ sót.
 * **Commit Retry Loop**: Nếu gọi `CommitMessages` gặp lỗi mạng tạm thời, consumer thử lại việc commit cho đến khi broker phản hồi thành công trước khi chuyển sang fetch message tiếp theo.
 
-### 2.5. Hệ Thống Flash Sale & Giỏ Hàng Hỗn Hợp (Flash Sale & Mixed-Cart Engine)
-Hệ thống hỗ trợ 2 luồng đặt hàng Flash Sale độc lập, được mô tả chi tiết tại [FLASH_SALE_ARCHITECTURE.md](FLASH_SALE_ARCHITECTURE.md):
+### 2.5. Động Cơ Flash Sale Unified Checkout (Revision 2)
+Hệ thống áp dụng kiến trúc **Unified Checkout Đơn Nhất** chuẩn production, hợp nhất 100% hàng thường và hàng Flash Sale vào 1 giỏ hàng và 1 giao dịch đặt hàng duy nhất (`POST /orders/checkout`), được mô tả chi tiết tại [FLASH_SALE_ARCHITECTURE.md](FLASH_SALE_ARCHITECTURE.md) và [FLASH_SALE_CHECKOUT_ACCEPTANCE_PLAN.md](FLASH_SALE_CHECKOUT_ACCEPTANCE_PLAN.md):
 
-1. **Luồng 1: Standalone Hot-Path (Mua ngay 1 chạm / Tranh mua siêu tốc)**:
-   - **Endpoint**: `POST /flash-sales/:campaignId/items/:productId/orders` (COD-only).
-   - **Tầng Hot-Path In-Memory**: Chặn đứng 99% tải tranh mua tại Redis Cluster thông qua Atomic Lua Script (`ReserveFlashSaleStock`). Kiểm tra quota người dùng và trừ kho trong RAM chỉ mất vài mili-giây.
-   - **Tầng Bền Vững**: Ghi bản ghi `flash_sale_reservations` (RESERVED) kèm Outbox Event trong 1 Transaction tại `ecom_order_db`. Trả về `202 Accepted` ngay lập tức.
-   - **Realtime Notification**: Khách hàng mở kết nối **Server-Sent Events (SSE)** `/flash-sales/orders/:id/stream` nhận kết quả `CONFIRMED` realtime từ Redis Pub/Sub khi `FlashSaleWorker` hoàn tất tạo đơn.
-   - **Đồng bộ Sổ Cái**: Sự kiện `flashsale.confirmed` gửi sang Product Service để tăng `sold_quantity` trên bảng `product_stock_allocations` (bảo vệ chống trùng lặp bằng `processed_events`).
+1. **Pipeline Checkout Đơn Nhất (Canonical Checkout)**:
+   - **Endpoint**: `POST /orders/checkout/quote` (Báo giá & Ký số `QuoteToken` HMAC-SHA256) và `POST /orders/checkout` (Đặt hàng chuẩn hóa, hỗ trợ `from_cart: true/false`).
+   - **Frontend Attempt Envelope (R3)**: Lưu phiên đặt hàng trong `sessionStorage`, tự động retry tối đa 5 lần với exponential backoff kèm jitter $\pm 20\%$. Hỗ trợ khôi phục tiến trình khi reload trang.
+   - **Canonical Request Fingerprint (R5)**: Băm SHA-256 trên struct đã chuẩn hóa (sắp xếp ID sản phẩm tăng dần, gộp dòng trùng, lowercase email). Phát hiện ngay lập tức hành vi sửa đổi nội dung với cùng một Idempotency-Key (`409 IDEMPOTENCY_CONFLICT`).
 
-2. **Luồng 2: Mixed-Cart Checkout (Giỏ hàng hỗn hợp Flash Sale + Hàng thường)**:
-   - **Endpoint**: `POST /orders/checkout/quote` (Báo giá & Ký số `QuoteToken` HMAC-SHA256) và `POST /orders/checkout` (Đặt hàng).
-   - **Bảo Vệ Giá & Chống Bán Âm Thầm (HTTP 409 Re-Quote)**: Nếu suất Flash Sale hết hàng, khách vượt quota hoặc giá thay đổi sau khi quote, hệ thống trả về mã lỗi `409 Conflict` kèm `new_quote_token` mới và danh sách `affected_items`. Buộc người dùng xác nhận giá mới trên giao diện, không tự ý chuyển sang giá thường.
-   - **Giao Dịch Kép Nguyên Tử Tại Order DB**: Tạo Order (status `PENDING`), tạo `flash_sale_reservations` với `FlashSaleItemID` chính xác, tăng `reserved_stock` có điều kiện, và ghi Outbox `MIXED_STOCK_DEDUCT_REQUEST` (topic `mixed.stock.request`) trong cùng 1 Transaction duy nhất.
-   - **Saga Trừ Kho Có Operation Ledger (Product Service)**: `MixedOrderStockWorker` quản lý trạng thái trừ kho bằng bảng `mixed_order_stock_operations` với `SELECT ... FOR UPDATE` theo `order_id`. Trừ kho thường và trả kết quả qua topic `mixed.stock.result`.
-   - **Bồi Hoàn Hai Chiều & Chống Treo Kho**: Nếu trừ kho thường thất bại hoặc suất Flash Sale hết hạn trong lúc chờ, hệ thống phát Outbox `mixed.stock.compensate` để Product Service hoàn kho `products.stock`. Xử lý an toàn trường hợp Late Success (kết quả thành công đến muộn khi đơn đã bị hủy).
-   - **Drain Barrier & Settlement Barrier Khi Kết Thúc Campaign**: Chiến dịch sale chỉ được giải phóng kho thừa về `products.stock` khi toàn bộ suất giữ chỗ giỏ hỗn hợp đã xả cạn (`reserved_stock == 0`) và sổ cái Product DB khớp chính xác 100% với Order DB (`Product.sold == Order.sold`).
+2. **Transaction Fencing 5 Bước Nguyên Tử & CAS State Machine (R1 & R4)**:
+   - Trong 1 Transaction duy nhất tại `ecom_order_db`: Lấy `FOR SHARE` lock trên campaign $\rightarrow$ Kiểm tra quota Flash Sale $\rightarrow$ Chèn Outbox event Saga $\rightarrow$ Tạo `orders` $\rightarrow$ Chốt `checkout_attempts` sang `COMPLETED` với Fencing Version CAS check.
+   - Ngăn chặn triệt để Stale Slow Worker ghi đè kết quả khi lease bị quá hạn. Phân giải Commit Outcome trước khi giải phóng Redis để loại bỏ hoàn toàn nguy cơ bán âm kho.
+
+3. **Marker `CLOSED` Trên Redis Lua Script (R2)**:
+   - Sau khi attempt bị cleanup hoặc recovery, hệ thống ghi marker `CLOSED` (0 TTL) trên Redis; Lua script `ReserveFlashSaleStock` từ chối tức thì các request trễ mạng sau 120s, triệt tiêu ghost reservation và rò rỉ quota.
+
+4. **Snapshot Delta Cart Cleanup**:
+   - Dọn giỏ hàng theo quantity delta (`cartItem.Quantity - orderItem.Quantity`), bảo toàn chính xác các sản phẩm mà khách hàng thêm mới trong lúc request checkout đang in-flight.
+
+5. **Saga Trừ Kho Có Operation Ledger & Barrier Bảo Vệ (Product Service)**:
+   - Bảng `mixed_order_stock_operations` lưu vết `DEDUCTED`/`COMPENSATED`, xử lý an toàn duplicate message và Late Success.
+   - **Drain Barrier & Settlement Barrier**: Chỉ cho phép kết thúc Flash Sale khi toàn bộ reservation in-flight đã xả cạn (`ReservedStock == 0`) và sổ cái 2 database đối soát khớp 100% (`Product.sold == Order.sold`).
 
 
 ---

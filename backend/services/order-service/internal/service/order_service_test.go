@@ -2,145 +2,44 @@ package service
 
 import (
 	"context"
-	"ecomerce-service/pkg/kafka"
-	"ecomerce-service/pkg/redislock"
-	"ecomerce-service/services/order-service/internal/domain"
-	"ecomerce-service/services/order-service/internal/dto"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"ecomerce-service/pkg/kafka"
+	"ecomerce-service/services/order-service/internal/domain"
+	"ecomerce-service/services/order-service/internal/dto"
+	"ecomerce-service/services/order-service/internal/repository"
+
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-type mockCartRepositoryForOrderService struct {
-	carts map[string]*domain.Cart
-	items map[uint][]domain.CartItem
-	seq   uint
+type mockProductClient struct {
+	products map[uint]*dto.ProductDetailResponse
 }
 
-func newMockCartRepositoryForOrderService() *mockCartRepositoryForOrderService {
-	return &mockCartRepositoryForOrderService{
-		carts: make(map[string]*domain.Cart),
-		items: make(map[uint][]domain.CartItem),
-		seq:   1,
+func (m *mockProductClient) GetProduct(ctx context.Context, productID uint) (*dto.ProductDetailResponse, error) {
+	p, ok := m.products[productID]
+	if !ok {
+		return nil, errors.New("product not found")
 	}
+	return p, nil
 }
 
-func (m *mockCartRepositoryForOrderService) GetCartByUserID(userID string) (*domain.Cart, error) {
-	cart, exists := m.carts[userID]
-	if !exists {
-		cart = &domain.Cart{
-			ID:     m.seq,
-			UserID: userID,
-			Items:  []domain.CartItem{},
-		}
-		m.carts[userID] = cart
-		m.items[cart.ID] = []domain.CartItem{}
-		m.seq++
-	}
-	cart.Items = m.items[cart.ID]
-	return cart, nil
-}
-
-func (m *mockCartRepositoryForOrderService) AddItem(cartID uint, item *domain.CartItem) error {
-	items := m.items[cartID]
-	for i, it := range items {
-		if it.ProductID == item.ProductID {
-			items[i].Quantity += item.Quantity
-			m.items[cartID] = items
-			return nil
-		}
-	}
-	item.ID = uint(len(items) + 1)
-	item.CartID = cartID
-	m.items[cartID] = append(items, *item)
+func (m *mockProductClient) AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error {
 	return nil
 }
 
-func (m *mockCartRepositoryForOrderService) UpdateItemQuantity(cartID uint, itemID uint, quantity int) error {
+func (m *mockProductClient) ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error {
 	return nil
 }
 
-func (m *mockCartRepositoryForOrderService) RemoveItem(cartID uint, itemID uint) error {
-	return nil
-}
-
-func (m *mockCartRepositoryForOrderService) ClearCart(cartID uint) error {
-	m.items[cartID] = []domain.CartItem{}
-	return nil
-}
-
-type mockOrderRepositoryForOrderService struct {
-	orders []*domain.Order
-	seq    uint
-}
-
-func newMockOrderRepositoryForOrderService() *mockOrderRepositoryForOrderService {
-	return &mockOrderRepositoryForOrderService{
-		orders: []*domain.Order{},
-		seq:    1,
-	}
-}
-
-func (m *mockOrderRepositoryForOrderService) CreateOrder(order *domain.Order) error {
-	order.ID = m.seq
-	m.seq++
-	for i := range order.Items {
-		order.Items[i].ID = uint(i + 1)
-		order.Items[i].OrderID = order.ID
-	}
-	m.orders = append(m.orders, order)
-	return nil
-}
-
-func (m *mockOrderRepositoryForOrderService) FindByID(id uint) (*domain.Order, error) {
-	for _, o := range m.orders {
-		if o.ID == id {
-			return o, nil
-		}
-	}
-	return nil, nil
-}
-
-func (m *mockOrderRepositoryForOrderService) FindByOrderCode(orderCode string) (*domain.Order, error) {
-	for _, o := range m.orders {
-		if o.OrderCode == orderCode {
-			return o, nil
-		}
-	}
-	return nil, nil
-}
-
-func (m *mockOrderRepositoryForOrderService) FindByUserID(userID string, page int, limit int) ([]*domain.Order, int64, error) {
-	var result []*domain.Order
-	for _, o := range m.orders {
-		if o.UserID == userID {
-			result = append(result, o)
-		}
-	}
-	return result, int64(len(result)), nil
-}
-
-func (m *mockOrderRepositoryForOrderService) UpdateStatus(orderID uint, status string) error {
-	for _, o := range m.orders {
-		if o.ID == orderID {
-			o.OrderStatus = status
-			return nil
-		}
-	}
-	return nil
-}
-
-func (m *mockOrderRepositoryForOrderService) UpdatePaymentStatus(orderID uint, status string) error {
-	for _, o := range m.orders {
-		if o.ID == orderID {
-			o.PaymentStatus = status
-			return nil
-		}
-	}
-	return nil
+func (m *mockProductClient) GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error) {
+	return &dto.StockAllocationResponse{}, nil
 }
 
 func helperQuoteToken(t *testing.T, userID string, items []QuoteItem, total float64) string {
@@ -151,26 +50,50 @@ func helperQuoteToken(t *testing.T, userID string, items []QuoteItem, total floa
 	return tok
 }
 
-func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
+func setupOrderServiceTestDB(t *testing.T) (*gorm.DB, *miniredis.Miniredis, *redis.Client, OrderService, domain.CartRepository, domain.OrderRepository) {
+	dbName := fmt.Sprintf("file:ordersvc_test_%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("Không thể khởi tạo sqlite: %v", err)
+	}
+	_ = db.AutoMigrate(
+		&domain.Order{},
+		&domain.OrderItem{},
+		&domain.FlashSaleCampaign{},
+		&domain.FlashSaleItem{},
+		&domain.FlashSaleReservation{},
+		&domain.OutboxEvent{},
+		&domain.Cart{},
+		&domain.CartItem{},
+		&domain.CheckoutAttempt{},
+	)
 	mr, err := miniredis.Run()
 	if err != nil {
 		t.Fatalf("Không thể khởi chạy miniredis: %v", err)
 	}
-	defer mr.Close()
-
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-
-	cartRepo := newMockCartRepositoryForOrderService()
-	orderRepo := newMockOrderRepositoryForOrderService()
+	orderRepo := repository.NewOrderRepository(db)
+	cartRepo := repository.NewCartRepository(db)
+	fsRepo := repository.NewFlashSaleRepository(db)
 	producer := kafka.NewNoopOrderKafkaProducer()
 
 	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer, testQuoteSecret)
+	svc.(interface {
+		SetFlashSale(*gorm.DB, domain.FlashSaleRepository)
+	}).SetFlashSale(db, fsRepo)
+
+	return db, mr, rdb, svc, cartRepo, orderRepo
+}
+
+func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
+	_, mr, rdb, svc, cartRepo, _ := setupOrderServiceTestDB(t)
+	defer mr.Close()
+	defer rdb.Close()
+
 	ctx := context.Background()
 	userID := "user-abc"
 
 	// 1. Test tạo đơn trực tiếp thành công
-	_ = redislock.SetStock(ctx, rdb, 100, 50)
-
 	createReq := &dto.CreateOrderRequest{
 		CustomerName:    "Lê Tuấn Nhật",
 		CustomerEmail:   "nhat@example.com",
@@ -178,9 +101,9 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 		ShippingAddress: "123 Đường Công Nghệ, TP.HCM",
 		PaymentMethod:   "COD",
 		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 100, Quantity: 2, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-		}, 0),
-		FromCart:        false,
+			{ProductID: 100, Quantity: 2, QuotedPrice: 50000, PurchaseMode: "REGULAR"},
+		}, 100000),
+		FromCart: false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 100, Quantity: 2},
 		},
@@ -193,53 +116,58 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 	if orderResp.OrderCode == "" || len(orderResp.Items) != 1 {
 		t.Errorf("Tạo đơn hàng không hợp lệ: %+v", orderResp)
 	}
+	if orderResp.OrderStatus != domain.OrderStatusPending {
+		t.Errorf("Kỳ vọng order_status PENDING cho đơn regular outbox nhưng nhận %s", orderResp.OrderStatus)
+	}
 
-	// 2. Test mua vượt quá tồn kho (Flash Sale Lock)
-	overReq := &dto.CreateOrderRequest{
-		CustomerName:    "Khách Mua Sỉ",
+	// 2. Test thiếu / sai QuoteToken
+	badQuoteReq := &dto.CreateOrderRequest{
+		CustomerName:    "Khách Sai Quote",
 		CustomerEmail:   "si@example.com",
 		CustomerPhone:   "0987654321",
 		ShippingAddress: "Kho Tổng",
 		PaymentMethod:   "COD",
-		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 100, Quantity: 999, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-		}, 0),
+		QuoteToken:      "invalid.quote.token",
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
-			{ProductID: 100, Quantity: 999},
+			{ProductID: 100, Quantity: 1},
 		},
 	}
-
-	_, err = svc.CreateOrder(ctx, userID, overReq)
+	_, err = svc.CreateOrder(ctx, userID, badQuoteReq)
 	if err == nil {
-		t.Error("Kỳ vọng lỗi hết hàng / tồn kho không đủ nhưng thành công")
+		t.Error("Kỳ vọng lỗi khi quote token sai nhưng lại thành công")
 	}
 
 	// 3. Test tạo đơn từ Giỏ hàng
-	_ = redislock.SetStock(ctx, rdb, 200, 10)
-	cartSvc := NewCartService(cartRepo, nil)
-	_, _ = cartSvc.AddToCart(ctx, userID, &dto.AddToCartRequest{
+	prodClient := &mockProductClient{products: map[uint]*dto.ProductDetailResponse{
+		200: {ID: 200, Name: "Sản phẩm giỏ hàng", Price: 30000, Stock: 50},
+	}}
+	cartSvc := NewCartService(cartRepo, prodClient)
+	_, err = cartSvc.AddToCart(ctx, userID, &dto.AddToCartRequest{
 		ProductID: 200,
 		Quantity:  3,
 	})
+	if err != nil {
+		t.Fatalf("Lỗi AddToCart: %v", err)
+	}
 
 	cartOrderReq := &dto.CreateOrderRequest{
 		CustomerName:    "Lê Tuấn Nhật",
 		CustomerEmail:   "nhat@example.com",
 		CustomerPhone:   "0987654321",
 		ShippingAddress: "123 Đường Công Nghệ, TP.HCM",
-		PaymentMethod:   "VNPAY",
+		PaymentMethod:   "COD",
 		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 200, Quantity: 3, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-		}, 0),
-		FromCart:        true,
+			{ProductID: 200, Quantity: 3, QuotedPrice: 30000, PurchaseMode: "REGULAR"},
+		}, 90000),
+		FromCart: true,
 	}
 
 	cartOrderResp, err := svc.CreateOrder(ctx, userID, cartOrderReq)
 	if err != nil {
 		t.Fatalf("Lỗi CreateOrder từ giỏ hàng: %v", err)
 	}
-	if cartOrderResp.TotalAmount <= 0 {
+	if cartOrderResp.TotalAmount != 90000 {
 		t.Errorf("Tổng tiền không hợp lệ: %.2f", cartOrderResp.TotalAmount)
 	}
 
@@ -251,11 +179,10 @@ func TestOrderService_CreateOrder_DirectAndFromCart(t *testing.T) {
 }
 
 func TestOrderService_GetOrderAndStatus(t *testing.T) {
-	cartRepo := newMockCartRepositoryForOrderService()
-	orderRepo := newMockOrderRepositoryForOrderService()
-	producer := kafka.NewNoopOrderKafkaProducer()
+	_, mr, rdb, svc, _, _ := setupOrderServiceTestDB(t)
+	defer mr.Close()
+	defer rdb.Close()
 
-	svc := NewOrderService(orderRepo, cartRepo, nil, nil, producer, testQuoteSecret)
 	ctx := context.Background()
 	userID := "user-xyz"
 
@@ -267,14 +194,17 @@ func TestOrderService_GetOrderAndStatus(t *testing.T) {
 		ShippingAddress: "Địa chỉ nhận",
 		PaymentMethod:   "COD",
 		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 1, Quantity: 1, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-		}, 0),
-		FromCart:        false,
+			{ProductID: 1, Quantity: 1, QuotedPrice: 50000, PurchaseMode: "REGULAR"},
+		}, 50000),
+		FromCart: false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 1, Quantity: 1},
 		},
 	}
-	created, _ := svc.CreateOrder(ctx, userID, orderReq)
+	created, err := svc.CreateOrder(ctx, userID, orderReq)
+	if err != nil {
+		t.Fatalf("Lỗi tạo đơn hàng: %v", err)
+	}
 
 	// 1. GetOrderByID - Chính chủ xem -> OK
 	order, err := svc.GetOrderByID(ctx, created.ID, userID, "CUSTOMER")
@@ -311,140 +241,170 @@ func TestOrderService_GetOrderAndStatus(t *testing.T) {
 	}
 }
 
-type mockProductClient struct {
-	products map[uint]*dto.ProductDetailResponse
-}
-
-func (m *mockProductClient) GetProduct(ctx context.Context, productID uint) (*dto.ProductDetailResponse, error) {
-	p, ok := m.products[productID]
-	if !ok {
-		return nil, errors.New("product not found")
-	}
-	return p, nil
-}
-
-func (m *mockProductClient) AllocateFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string, quantity int) error {
-	return nil
-}
-
-func (m *mockProductClient) ReleaseFlashSaleStock(ctx context.Context, campaignID, productID uint, requestID string) error {
-	return nil
-}
-
-func (m *mockProductClient) GetStockAllocation(ctx context.Context, campaignID, productID uint) (*dto.StockAllocationResponse, error) {
-	return &dto.StockAllocationResponse{}, nil
-}
-
-func TestOrderService_MultiItemRollback_WhenOneItemFails(t *testing.T) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("Không thể khởi chạy miniredis: %v", err)
-	}
+func TestOrderService_ReplayFirst_EvenIfQuoteExpired(t *testing.T) {
+	_, mr, rdb, svc, _, _ := setupOrderServiceTestDB(t)
 	defer mr.Close()
+	defer rdb.Close()
 
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	cartRepo := newMockCartRepositoryForOrderService()
-	orderRepo := newMockOrderRepositoryForOrderService()
-	producer := kafka.NewNoopOrderKafkaProducer()
-
-	svc := NewOrderService(orderRepo, cartRepo, nil, rdb, producer, testQuoteSecret)
 	ctx := context.Background()
-	userID := "user-rollback-test"
+	userID := "user-replay"
 
-	// Sản phẩm 1 có tồn kho = 10 trên Redis
-	_ = redislock.SetStock(ctx, rdb, 1, 10)
-	// Sản phẩm 2 có tồn kho = 0 trên Redis (hết hàng)
-	_ = redislock.SetStock(ctx, rdb, 2, 0)
+	// 1. Tạo đơn lần đầu thành công với quote token có TTL 1 giây
+	quoteTok, err := GenerateQuoteToken([]byte(testQuoteSecret), userID, []QuoteItem{
+		{ProductID: 1, Quantity: 2, QuotedPrice: 50000, PurchaseMode: "REGULAR"},
+	}, 100000, 1*time.Second)
+	if err != nil {
+		t.Fatalf("GenerateQuoteToken failed: %v", err)
+	}
 
-	// Đặt mua cả sản phẩm 1 (số lượng 2) và sản phẩm 2 (số lượng 1)
-	req := &dto.CreateOrderRequest{
-		CustomerName:    "Khách Hàng Test",
-		CustomerEmail:   "test@example.com",
-		CustomerPhone:   "0123456789",
-		ShippingAddress: "Địa chỉ nhận hàng",
+	orderReq := &dto.CreateOrderRequest{
+		CustomerName:    "Người Replay",
+		CustomerEmail:   "replay@example.com",
+		CustomerPhone:   "0988776655",
+		ShippingAddress: "123 Đường Test, Hà Nội",
 		PaymentMethod:   "COD",
-		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 1, Quantity: 2, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-			{ProductID: 2, Quantity: 1, QuotedPrice: 0, PurchaseMode: "REGULAR"},
-		}, 0),
+		IdempotencyKey:  "idemp-key-replay-999",
+		QuoteToken:      quoteTok,
 		FromCart:        false,
 		Items: []dto.CreateOrderItemRequest{
 			{ProductID: 1, Quantity: 2},
-			{ProductID: 2, Quantity: 1},
+		},
+	}
+
+	firstResp, err := svc.CreateOrder(ctx, userID, orderReq)
+	if err != nil {
+		t.Fatalf("Lỗi tạo đơn ban đầu: %v", err)
+	}
+
+	// 2. Chờ clock vượt expiry của CHÍNH token ban đầu đã dùng (T08)
+	for {
+		if _, verifyErr := VerifyQuoteToken([]byte(testQuoteSecret), quoteTok, userID); verifyErr == ErrQuoteExpired {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Tắt Redis để mô phỏng Redis không sẵn sàng lúc replay (T08)
+	mr.Close()
+
+	// Giữ nguyên requestFingerprint khớp đơn ban đầu (chứa chính quoteTok ban đầu đã expired)
+	replayReq := &dto.CreateOrderRequest{
+		CustomerName:    "Người Replay",
+		CustomerEmail:   "replay@example.com",
+		CustomerPhone:   "0988776655",
+		ShippingAddress: "123 Đường Test, Hà Nội",
+		PaymentMethod:   "COD",
+		IdempotencyKey:  "idemp-key-replay-999",
+		QuoteToken:      orderReq.QuoteToken, // Chính token đã dùng và nay đã hết hạn
+		FromCart:        false,
+		Items: []dto.CreateOrderItemRequest{
+			{ProductID: 1, Quantity: 2},
+		},
+	}
+
+	replayResp, err := svc.CreateOrder(ctx, userID, replayReq)
+	if err != nil {
+		t.Fatalf("Kỳ vọng Replay thành công khi token hết hạn và Redis down nhưng bị lỗi: %v", err)
+	}
+	if replayResp.ID != firstResp.ID || replayResp.OrderCode != firstResp.OrderCode {
+		t.Errorf("Kỳ vọng replay ra đúng đơn cũ ID=%d nhưng nhận ID=%d", firstResp.ID, replayResp.ID)
+	}
+
+	// 3. Nếu gửi cùng IdempotencyKey nhưng đổi địa chỉ giao hàng -> Phải báo IDEMPOTENCY_CONFLICT
+	conflictReq := &dto.CreateOrderRequest{
+		CustomerName:    "Người Replay",
+		CustomerEmail:   "replay@example.com",
+		CustomerPhone:   "0988776655",
+		ShippingAddress: "999 Địa Chỉ Khác, TP.HCM", // Thay đổi fingerprint
+		PaymentMethod:   "COD",
+		IdempotencyKey:  "idemp-key-replay-999",
+		QuoteToken:      orderReq.QuoteToken,
+		FromCart:        false,
+		Items: []dto.CreateOrderItemRequest{
+			{ProductID: 1, Quantity: 2},
+		},
+	}
+	_, err = svc.CreateOrder(ctx, userID, conflictReq)
+	if err == nil {
+		t.Fatal("Kỳ vọng lỗi IDEMPOTENCY_CONFLICT khi thay đổi thông tin nhưng lại thành công")
+	}
+}
+
+func TestOrderService_FailClosedRedis_WhenFlashSale(t *testing.T) {
+	dbName := fmt.Sprintf("file:ordersvc_failclosed_%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("Không thể khởi tạo sqlite: %v", err)
+	}
+	_ = db.AutoMigrate(
+		&domain.Order{},
+		&domain.OrderItem{},
+		&domain.FlashSaleCampaign{},
+		&domain.FlashSaleItem{},
+		&domain.FlashSaleReservation{},
+		&domain.OutboxEvent{},
+		&domain.Cart{},
+		&domain.CartItem{},
+		&domain.CheckoutAttempt{},
+	)
+	orderRepo := repository.NewOrderRepository(db)
+	cartRepo := repository.NewCartRepository(db)
+	fsRepo := repository.NewFlashSaleRepository(db)
+	producer := kafka.NewNoopOrderKafkaProducer()
+
+	// Svc với redisClient = nil (Mô phỏng Redis outage)
+	svc := NewOrderService(orderRepo, cartRepo, nil, nil, producer, testQuoteSecret)
+	svc.(interface {
+		SetFlashSale(*gorm.DB, domain.FlashSaleRepository)
+	}).SetFlashSale(db, fsRepo)
+
+	// Tạo active campaign trong DB
+	now := time.Now()
+	camp := &domain.FlashSaleCampaign{
+		Name:      "Flash Sale Test Fail Closed",
+		StartsAt:  now.Add(-10 * time.Minute),
+		EndsAt:    now.Add(50 * time.Minute),
+		Status:    domain.CampaignStatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Items: []domain.FlashSaleItem{
+			{
+				ProductID:      99,
+				SalePrice:      10000,
+				AllocatedStock: 10,
+				SoldStock:      0,
+			},
+		},
+	}
+	_ = fsRepo.CreateCampaign(camp)
+
+	ctx := context.Background()
+	userID := "user-fail-closed"
+	campID := camp.ID
+
+	quoteTok, _ := GenerateQuoteToken([]byte(testQuoteSecret), userID, []QuoteItem{
+		{ProductID: 99, Quantity: 1, QuotedPrice: 10000, IsFlashSale: true, CampaignID: &campID, PurchaseMode: "FLASH_SALE"},
+	}, 10000, 10*time.Minute)
+
+	req := &dto.CreateOrderRequest{
+		CustomerName:    "Test User",
+		CustomerEmail:   "failclosed@example.com",
+		CustomerPhone:   "0911223344",
+		ShippingAddress: "Địa chỉ",
+		PaymentMethod:   "COD",
+		QuoteToken:      quoteTok,
+		FromCart:        false,
+		Items: []dto.CreateOrderItemRequest{
+			{ProductID: 99, Quantity: 1},
 		},
 	}
 
 	_, err = svc.CreateOrder(ctx, userID, req)
 	if err == nil {
-		t.Fatal("Kỳ vọng đơn hàng thất bại do sản phẩm 2 hết hàng, nhưng lại thành công")
+		t.Fatal("Kỳ vọng lỗi fail-closed khi Redis nil cho Flash Sale item nhưng lại thành công")
 	}
-
-	// KIỂM TRA ROLLBACK: Tồn kho của sản phẩm 1 trên Redis PHẢI ĐƯỢC HOÀN LẠI VỀ 10
-	stock1, err := redislock.GetStock(ctx, rdb, 1)
-	if err != nil {
-		t.Fatalf("Lỗi GetStock: %v", err)
-	}
-	if stock1 != 10 {
-		t.Errorf("Kỳ vọng tồn kho sản phẩm 1 được hoàn lại là 10 sau khi rollback, nhưng thực tế còn: %d", stock1)
-	}
-}
-
-func TestOrderService_LazyLoadingStock_FromDB(t *testing.T) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("Không thể khởi chạy miniredis: %v", err)
-	}
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	cartRepo := newMockCartRepositoryForOrderService()
-	orderRepo := newMockOrderRepositoryForOrderService()
-	prodClient := &mockProductClient{products: make(map[uint]*dto.ProductDetailResponse)}
-	producer := kafka.NewNoopOrderKafkaProducer()
-
-	// Sản phẩm ID = 300 có tồn kho = 25 trong Product Service, nhưng CHƯA CÓ TRÊN REDIS (Cache Miss)
-	prodClient.products[300] = &dto.ProductDetailResponse{
-		ID:    300,
-		Name:  "Máy Giặt Bosch Inverter",
-		Slug:  "may-giat-bosch-inverter",
-		Price: 15000000,
-		Stock: 25,
-	}
-
-	svc := NewOrderService(orderRepo, cartRepo, prodClient, rdb, producer, testQuoteSecret)
-	ctx := context.Background()
-	userID := "user-lazy-test"
-
-	req := &dto.CreateOrderRequest{
-		CustomerName:    "Khách Hàng Lazy",
-		CustomerEmail:   "lazy@example.com",
-		CustomerPhone:   "0123456789",
-		ShippingAddress: "Địa chỉ giao hàng",
-		PaymentMethod:   "COD",
-		QuoteToken: helperQuoteToken(t, userID, []QuoteItem{
-			{ProductID: 300, Quantity: 3, QuotedPrice: 15000000, PurchaseMode: "REGULAR"},
-		}, 45000000),
-		FromCart:        false,
-		Items: []dto.CreateOrderItemRequest{
-			{ProductID: 300, Quantity: 3},
-		},
-	}
-
-	orderResp, err := svc.CreateOrder(ctx, userID, req)
-	if err != nil {
-		t.Fatalf("Lỗi tạo đơn hàng có cơ chế Lazy Loading: %v", err)
-	}
-	if orderResp.OrderCode == "" {
-		t.Errorf("Tạo đơn hàng không thành công: %+v", orderResp)
-	}
-
-	// KIỂM TRA: Tồn kho trên Redis bây giờ phải tự động nạp từ DB (25) và trừ đi 3 = 22
-	stockOnRedis, err := redislock.GetStock(ctx, rdb, 300)
-	if err != nil {
-		t.Fatalf("Lỗi GetStock trên Redis sau Lazy Load: %v", err)
-	}
-	if stockOnRedis != 22 {
-		t.Errorf("Kỳ vọng tồn kho trên Redis sau khi Lazy Load & Deduct là 22, nhưng thực tế là: %d", stockOnRedis)
+	if err.Error() == "" || !errors.Is(err, errors.New(err.Error())) {
+		// Just ensure error returned
 	}
 }
 

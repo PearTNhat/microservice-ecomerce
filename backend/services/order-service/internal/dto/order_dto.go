@@ -16,8 +16,22 @@ type CreateOrderRequest struct {
 	PaymentMethod   string                   `json:"payment_method" validate:"required,oneof=COD VNPAY MOMO BANK_TRANSFER"`
 	FromCart        bool                     `json:"from_cart"`
 	QuoteToken      string                   `json:"quote_token,omitempty"`
+	IdempotencyKey  string                   `json:"idempotency_key,omitempty"`
 	Items           []CreateOrderItemRequest `json:"items,omitempty"`
 }
+
+// Mã lỗi HTTP Contract cho Checkout và Idempotency (R3 + R5)
+const (
+	ErrCodeIdempotencyKeyRequired = "IDEMPOTENCY_KEY_REQUIRED"
+	ErrCodeIdempotencyKeyMismatch = "IDEMPOTENCY_KEY_MISMATCH"
+	ErrCodeOrderProcessing        = "ORDER_PROCESSING"
+	ErrCodeIdempotencyConflict    = "IDEMPOTENCY_CONFLICT"
+	ErrCodeQuoteChanged           = "QUOTE_CHANGED"
+	ErrCodeQuoteExpired           = "QUOTE_EXPIRED"
+	ErrCodeCheckoutRetryable      = "CHECKOUT_RETRYABLE"
+	ErrCodeCheckoutOutcomeUnknown = "CHECKOUT_OUTCOME_UNKNOWN"
+	ErrCodeFlashSaleUnavailable   = "FLASH_SALE_SERVICE_UNAVAILABLE"
+)
 
 // PriceConflictItem mô tả món hàng bị thay đổi giá hoặc hết suất Flash Sale
 type PriceConflictItem struct {
@@ -116,35 +130,6 @@ type OrderListResponse struct {
 // UpdateOrderStatusRequest cập nhật trạng thái đơn
 type UpdateOrderStatusRequest struct {
 	Status string `json:"status" validate:"required,oneof=PENDING CONFIRMED PROCESSING SHIPPED DELIVERED CANCELLED"`
-}
-
-// FlashSaleOrderRequest yêu cầu mua hàng Flash Sale bất đồng bộ
-type FlashSaleOrderRequest struct {
-	ProductID       uint   `json:"product_id" validate:"required,gt=0"`
-	Quantity        int    `json:"quantity" validate:"required,gt=0"`
-	CustomerName    string `json:"customer_name" validate:"required"`
-	CustomerEmail   string `json:"customer_email" validate:"required,email"`
-	CustomerPhone   string `json:"customer_phone" validate:"required"`
-	ShippingAddress string `json:"shipping_address" validate:"required"`
-	PaymentMethod   string `json:"payment_method" validate:"required,oneof=COD VNPAY MOMO BANK_TRANSFER"`
-}
-
-// FlashSaleOrderAsyncResponse phản hồi tức thì khi đưa đơn vào hàng đợi (HTTP 202 Accepted)
-type FlashSaleOrderAsyncResponse struct {
-	OrderToken     string `json:"order_token"`
-	Status         string `json:"status"`
-	Message        string `json:"message"`
-	CheckStatusURL string `json:"check_status_url"`
-}
-
-// FlashSaleStatusResponse kết quả polling trạng thái đơn hàng từ Redis RAM
-type FlashSaleStatusResponse struct {
-	OrderToken string `json:"order_token"`
-	Status     string `json:"status"` // PENDING, SUCCESS, FAILED
-	OrderID    uint   `json:"order_id,omitempty"`
-	OrderCode  string `json:"order_code,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
 }
 
 // PrewarmStockRequest yêu cầu nạp trước tồn kho Flash Sale

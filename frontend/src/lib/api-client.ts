@@ -43,10 +43,19 @@ export async function apiClient<T>(endpoint: string, options: FetchOptions = {})
 
   try {
     const response = await fetch(url, config);
-    const data = await response.json();
+    let data: any = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = { message: response.statusText || `Lỗi máy chủ (${response.status})` };
+    }
 
     if (!response.ok) {
-      throw new Error(data.message || `Lỗi yêu cầu máy chủ: ${response.status}`);
+      const error: any = new Error(data?.message || `Lỗi yêu cầu máy chủ: ${response.status}`);
+      error.status = response.status;
+      error.response = { status: response.status, data };
+      error.code = data?.code;
+      throw error;
     }
 
     return data;

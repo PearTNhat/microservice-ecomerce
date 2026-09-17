@@ -1,4 +1,4 @@
-.PHONY: proto test build-all run-all run-gateway run-user run-product run-order run-docker
+.PHONY: proto test test-acceptance build-all run-all run-gateway run-user run-product run-order run-docker
 
 # Chạy toàn bộ 4 Microservices và Frontend cùng lúc (kèm log màu)
 run-all:
@@ -26,6 +26,16 @@ test-e2e:
 
 test-flash-sale:
 	./test_flash_sale.sh
+
+# Chạy toàn bộ 15 ca kiểm thử nghiệm thu (Acceptance Tests) với Race Detector (count=20)
+test-acceptance:
+	@echo "=== [1/3] Đang chạy Acceptance Tests với Race Detector (15 ca, count=20) ==="
+	go test -tags=acceptance -race -count=20 ./services/order-service/internal/service -run="TestAcceptance_"
+	@echo "=== [2/3] Chạy Unit Tests toàn hệ thống ==="
+	go test ./services/api-gateway/... ./services/user-service/... ./services/product-service/... ./services/order-service/... ./pkg/...
+	@echo "=== [3/3] Kiểm tra Frontend TypeCheck và Build ==="
+	cd ../frontend && npx tsc --noEmit && npm run build
+	@echo "✅ TOÀN BỘ ACCEPTANCE TESTS & PRODUCTION BUILDS HOÀN THÀNH 100%!"
 
 # Biên dịch tất cả binaries
 build-all:

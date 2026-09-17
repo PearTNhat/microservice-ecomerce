@@ -40,7 +40,10 @@ func SetupFlashSaleRoutes(rh *server.RestHandler, svc service.FlashSaleService, 
 	adminGroup.Post("/", handler.CreateCampaign)
 	adminGroup.Get("/", handler.ListCampaigns)
 	adminGroup.Get("/:campaignId", handler.GetCampaign)
+	adminGroup.Put("/:campaignId", handler.UpdateCampaign)
 	adminGroup.Post("/:campaignId/items", handler.AddItem)
+	adminGroup.Put("/:campaignId/items/:itemId", handler.UpdateItem)
+	adminGroup.Delete("/:campaignId/items/:itemId", handler.DeleteItem)
 	adminGroup.Post("/:campaignId/activate", handler.ActivateCampaign)
 	adminGroup.Post("/:campaignId/end", handler.EndCampaign)
 	adminGroup.Post("/:campaignId/clone", handler.CloneCampaign)
@@ -81,6 +84,25 @@ func (h *FlashSaleHandler) CreateCampaign(c *fiber.Ctx) error {
 	return response.Success(c, http.StatusCreated, "Tạo chiến dịch Flash Sale thành công", camp)
 }
 
+func (h *FlashSaleHandler) UpdateCampaign(c *fiber.Ctx) error {
+	campaignID, err := strconv.ParseUint(c.Params("campaignId"), 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "campaignId không hợp lệ", "INVALID_ID")
+	}
+
+	var req dto.UpdateCampaignRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Dữ liệu cập nhật không hợp lệ", "INVALID_BODY")
+	}
+
+	camp, err := h.svc.UpdateCampaign(c.UserContext(), uint(campaignID), &req)
+	if err != nil {
+		return response.BadRequest(c, err.Error(), "UPDATE_CAMPAIGN_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Cập nhật chiến dịch Flash Sale thành công", camp)
+}
+
 func (h *FlashSaleHandler) AddItem(c *fiber.Ctx) error {
 	campaignID, err := strconv.ParseUint(c.Params("campaignId"), 10, 32)
 	if err != nil {
@@ -98,6 +120,46 @@ func (h *FlashSaleHandler) AddItem(c *fiber.Ctx) error {
 	}
 
 	return response.Success(c, http.StatusCreated, "Thêm sản phẩm vào Flash Sale thành công", item)
+}
+
+func (h *FlashSaleHandler) UpdateItem(c *fiber.Ctx) error {
+	campaignID, err := strconv.ParseUint(c.Params("campaignId"), 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "campaignId không hợp lệ", "INVALID_ID")
+	}
+	itemID, err := strconv.ParseUint(c.Params("itemId"), 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "itemId không hợp lệ", "INVALID_ID")
+	}
+
+	var req dto.UpdateFlashSaleItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Dữ liệu item không hợp lệ", "INVALID_BODY")
+	}
+
+	item, err := h.svc.UpdateItem(c.UserContext(), uint(campaignID), uint(itemID), &req)
+	if err != nil {
+		return response.BadRequest(c, err.Error(), "UPDATE_ITEM_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Cập nhật sản phẩm Flash Sale thành công", item)
+}
+
+func (h *FlashSaleHandler) DeleteItem(c *fiber.Ctx) error {
+	campaignID, err := strconv.ParseUint(c.Params("campaignId"), 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "campaignId không hợp lệ", "INVALID_ID")
+	}
+	itemID, err := strconv.ParseUint(c.Params("itemId"), 10, 32)
+	if err != nil {
+		return response.BadRequest(c, "itemId không hợp lệ", "INVALID_ID")
+	}
+
+	if err := h.svc.DeleteItem(c.UserContext(), uint(campaignID), uint(itemID)); err != nil {
+		return response.BadRequest(c, err.Error(), "DELETE_ITEM_FAILED")
+	}
+
+	return response.Success(c, http.StatusOK, "Xóa sản phẩm khỏi chiến dịch thành công", nil)
 }
 
 func (h *FlashSaleHandler) ActivateCampaign(c *fiber.Ctx) error {
@@ -173,39 +235,7 @@ func (h *FlashSaleHandler) ListCampaigns(c *fiber.Ctx) error {
 }
 
 func (h *FlashSaleHandler) ReserveOrder(c *fiber.Ctx) error {
-	userID, _ := c.Locals("userID").(string)
-	if userID == "" {
-		return response.Unauthorized(c, "Bạn chưa đăng nhập")
-	}
-
-	requestID := c.Get("Idempotency-Key")
-	if requestID == "" {
-		requestID = c.Get("X-Request-ID")
-	}
-	if requestID == "" {
-		return response.BadRequest(c, "Thiếu header Idempotency-Key", "MISSING_IDEMPOTENCY_KEY")
-	}
-
-	campaignID, err := strconv.ParseUint(c.Params("campaignId"), 10, 32)
-	if err != nil {
-		return response.BadRequest(c, "campaignId không hợp lệ", "INVALID_CAMPAIGN_ID")
-	}
-	productID, err := strconv.ParseUint(c.Params("productId"), 10, 32)
-	if err != nil {
-		return response.BadRequest(c, "productId không hợp lệ", "INVALID_PRODUCT_ID")
-	}
-
-	var req dto.FlashSaleCustomerOrderRequest
-	if err := c.BodyParser(&req); err != nil {
-		return response.BadRequest(c, "Dữ liệu đặt hàng không hợp lệ", "INVALID_BODY")
-	}
-
-	resp, err := h.svc.ReserveOrder(c.UserContext(), uint(campaignID), uint(productID), userID, requestID, &req)
-	if err != nil {
-		return response.BadRequest(c, err.Error(), "FLASH_SALE_RESERVE_FAILED")
-	}
-
-	return response.Success(c, http.StatusAccepted, "Đã tiếp nhận yêu cầu mua hàng Flash Sale", resp)
+	return response.Error(c, fiber.StatusGone, "Luồng đặt hàng Flash Sale cũ đã ngừng hoạt động. Vui lòng thêm sản phẩm vào giỏ hàng và tiến hành thanh toán (/orders/checkout)", "FLASH_SALE_CHECKOUT_RETIRED")
 }
 
 func (h *FlashSaleHandler) GetOrderStatus(c *fiber.Ctx) error {

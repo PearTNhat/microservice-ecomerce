@@ -21,8 +21,8 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   BasketQuoteResponse,
   PaymentMethod,
@@ -31,15 +31,52 @@ import {
   QuoteLineDTO,
 } from "@/features/orders/types";
 
-export default function CheckoutPage() {
+export interface CheckoutAttemptEnvelope {
+  attempt_id?: number;
+  idempotency_key: string;
+  fingerprint: string;
+  payload: {
+    customer_name: string;
+    customer_email: string;
+    customer_phone: string;
+    shipping_address: string;
+    note?: string;
+    payment_method: PaymentMethod;
+    from_cart?: boolean;
+    quote_token?: string;
+    items?: { product_id: number; quantity: number }[];
+  };
+  quote_token?: string;
+  created_at: number;
+  status: "PENDING" | "RETRYING" | "SUCCESS" | "TERMINAL";
+}
+
+const MAX_BACKOFF_RETRIES = 5;
+const BASE_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+
+function getJitterDelay(baseMs: number): number {
+  const factor = 0.8 + Math.random() * 0.4;
+  return Math.round(baseMs * factor);
+}
+
+function CheckoutContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const isDirectMode = searchParams.get("mode") === "direct";
+
   const {
     items,
-    getTotalPrice,
+    directCheckoutDraft,
+    clearDirectCheckoutDraft,
+    removeSnapshotItems,
     clearCart,
     syncFlashSaleOffers,
-    hasFlashSaleItems,
   } = useCartStore();
+
+  const checkoutItems = useMemo(
+    () => (isDirectMode ? directCheckoutDraft || [] : items),
+    [isDirectMode, directCheckoutDraft, items]
+  );
 
   const [formData, setFormData] = useState({
     customer_name: "",
@@ -52,6 +89,10 @@ export default function CheckoutPage() {
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("COD");
   const [isLoading, setIsLoading] = useState(false);
   const [isPolling, setIsPolling] = useState(false);
+  const [userId, setUserId] = useState<string>("guest");
+  const [restoredEnvelope, setRestoredEnvelope] = useState<CheckoutAttemptEnvelope | null>(null);
+  const [retryStatusText, setRetryStatusText] = useState<string | null>(null);
+  const [allowManualRetry, setAllowManualRetry] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [quoteToken, setQuoteToken] = useState<string | undefined>(undefined);
   const [activeQuote, setActiveQuote] = useState<BasketQuoteResponse | null>(null);
@@ -68,32 +109,52 @@ export default function CheckoutPage() {
     message: "",
   });
 
-  const totalPrice = getTotalPrice();
-  const hasFlashSale = hasFlashSaleItems();
+  const totalPrice = useMemo(() => {
+    return checkoutItems.reduce((total, item) => {
+      const price =
+        item.isFlashSale && item.salePrice
+          ? item.salePrice
+          : item.product.discount_price || item.product.price;
+      return total + price * item.quantity;
+    }, 0);
+  }, [checkoutItems]);
+
+  const hasFlashSale = useMemo(() => {
+    return checkoutItems.some((item) => item.isFlashSale === true);
+  }, [checkoutItems]);
 
   // 19.1: Tạo fingerprint bất biến để chống re-render loop tại /checkout
   const basketFingerprint = useMemo(() => {
-    return items
+    return checkoutItems
       .map((it) => `${it.product.id}:${it.quantity}`)
       .sort()
       .join(",");
-  }, [items]);
+  }, [checkoutItems]);
+
+  // 10.5: Giữ idempotencyKey ổn định qua các lần retry trong cùng một attempt đặt hàng
+  const idempotencyKeyRef = useRef<string>("");
+  if (!idempotencyKeyRef.current) {
+    idempotencyKeyRef.current = `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+  }
+
+  useEffect(() => {
+    idempotencyKeyRef.current = `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+  }, [basketFingerprint]);
 
   // 19.1: Monotonic request ID để huỷ kết quả bất đồng bộ quá hạn
   const currentRequestId = useRef(0);
 
   // 17.1, 18.2, 19.1: Lấy báo giá giỏ hàng phụ thuộc DUY NHẤT vào basketFingerprint
   useEffect(() => {
-    const currentItems = useCartStore.getState().items;
-    if (currentItems.length === 0) {
+    if (checkoutItems.length === 0) {
       setQuoteStatus("idle");
       setActiveQuote(null);
       return;
     }
 
     const reqId = ++currentRequestId.current;
-    const ids = currentItems.map((it) => it.product.id);
-    const quoteItems = currentItems.map((it) => ({
+    const ids = checkoutItems.map((it) => it.product.id);
+    const quoteItems = checkoutItems.map((it) => ({
       product_id: it.product.id,
       quantity: it.quantity,
     }));
@@ -128,7 +189,7 @@ export default function CheckoutPage() {
         }
       })
       .catch(() => {});
-  }, [basketFingerprint, syncFlashSaleOffers]);
+  }, [basketFingerprint, checkoutItems, syncFlashSaleOffers]);
 
   const effectiveHasFlashSale = activeQuote
     ? activeQuote.items.some((i) => i.is_flash_sale)
@@ -141,12 +202,13 @@ export default function CheckoutPage() {
     }
   }, [effectiveHasFlashSale]);
 
-  // Tự động điền thông tin nếu đã đăng nhập
+  // Tự động điền thông tin nếu đã đăng nhập và lấy userId cho envelope
   useEffect(() => {
     const userStr = localStorage.getItem("user_info");
     if (userStr) {
       try {
         const user = JSON.parse(userStr);
+        if (user.id) setUserId(String(user.id));
         setFormData((prev) => ({
           ...prev,
           customer_name: `${user.first_name || ""} ${user.last_name || ""}`.trim() || user.email || "",
@@ -156,13 +218,94 @@ export default function CheckoutPage() {
     }
   }, []);
 
+  const storageKey = useMemo(() => {
+    return `ecom_checkout_envelope_${userId}_${isDirectMode ? "direct" : "cart"}`;
+  }, [userId, isDirectMode]);
+
+  // Khôi phục attempt envelope từ sessionStorage nếu có (Mục 6.2)
+  useEffect(() => {
+    if (typeof window === "undefined" || !storageKey) return;
+    try {
+      const raw = sessionStorage.getItem(storageKey);
+      if (raw) {
+        const env: CheckoutAttemptEnvelope = JSON.parse(raw);
+        if (env && (env.status === "PENDING" || env.status === "RETRYING")) {
+          setRestoredEnvelope(env);
+          idempotencyKeyRef.current = env.idempotency_key;
+          if (env.quote_token) {
+            setQuoteToken(env.quote_token);
+          }
+          if (env.payload) {
+            setFormData((prev) => ({
+              ...prev,
+              customer_name: env.payload.customer_name || prev.customer_name,
+              customer_email: env.payload.customer_email || prev.customer_email,
+              customer_phone: env.payload.customer_phone || prev.customer_phone,
+              shipping_address: env.payload.shipping_address || prev.shipping_address,
+              note: env.payload.note || prev.note,
+            }));
+            if (env.payload.payment_method) {
+              setPaymentMethod(env.payload.payment_method);
+            }
+          }
+        }
+      }
+    } catch (e) {}
+  }, [storageKey]);
+
+  useEffect(() => {
+    idempotencyKeyRef.current = `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    if (restoredEnvelope && restoredEnvelope.fingerprint && restoredEnvelope.fingerprint !== basketFingerprint) {
+      try {
+        sessionStorage.removeItem(storageKey);
+      } catch (e) {}
+      setRestoredEnvelope(null);
+      setAllowManualRetry(false);
+      setRetryStatusText(null);
+    }
+  }, [basketFingerprint]);
+
+  const cancelEnvelopeAndReset = () => {
+    try {
+      sessionStorage.removeItem(storageKey);
+    } catch (e) {}
+    setRestoredEnvelope(null);
+    setAllowManualRetry(false);
+    setRetryStatusText(null);
+    setErrorMsg(null);
+    idempotencyKeyRef.current = `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+  };
+
+  const handleAcceptNewQuote = () => {
+    cancelEnvelopeAndReset();
+    if (conflictInfo.newQuoteToken) {
+      setQuoteToken(conflictInfo.newQuoteToken);
+      if (conflictInfo.newItems && conflictInfo.newTotal !== undefined) {
+        setActiveQuote({
+          quote_token: conflictInfo.newQuoteToken,
+          total: conflictInfo.newTotal,
+          expires_at: Date.now() + 15 * 60 * 1000,
+          items: conflictInfo.newItems,
+        });
+      }
+      setQuoteStatus("ready");
+    }
+    syncFlashSaleOffers({});
+    setConflictInfo({ open: false, message: "" });
+    setErrorMsg(null);
+  };
+
+  const handleCancelNewQuote = () => {
+    setConflictInfo({ open: false, message: "" });
+    router.push("/cart");
+  };
+
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     const { name, value } = e.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
   };
 
-  const handleCheckout = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeOrderSubmission = async (targetEnvelope?: CheckoutAttemptEnvelope) => {
     setErrorMsg(null);
 
     // Kiểm tra đăng nhập
@@ -177,8 +320,8 @@ export default function CheckoutPage() {
       return;
     }
 
-    if (items.length === 0) {
-      setErrorMsg("Giỏ hàng của bạn đang trống!");
+    if (checkoutItems.length === 0) {
+      setErrorMsg(isDirectMode ? "Chưa có thông tin sản phẩm Mua Ngay!" : "Giỏ hàng của bạn đang trống!");
       return;
     }
 
@@ -187,117 +330,238 @@ export default function CheckoutPage() {
       return;
     }
 
-    setIsLoading(true);
+    const orderItems = checkoutItems.map((it) => ({
+      product_id: it.product.id,
+      quantity: it.quantity,
+    }));
 
+    let currentEnvelope: CheckoutAttemptEnvelope = targetEnvelope || {
+      idempotency_key: idempotencyKeyRef.current || `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      fingerprint: basketFingerprint,
+      payload: {
+        customer_name: formData.customer_name,
+        customer_email: formData.customer_email,
+        customer_phone: formData.customer_phone,
+        shipping_address: formData.shipping_address,
+        note: formData.note,
+        payment_method: paymentMethod,
+        from_cart: false,
+        quote_token: quoteToken,
+        items: orderItems,
+      },
+      quote_token: quoteToken,
+      created_at: Date.now(),
+      status: "PENDING",
+    };
+
+    idempotencyKeyRef.current = currentEnvelope.idempotency_key;
     try {
-      // 1. Chuẩn bị danh sách sản phẩm để gửi
-      const orderItems = items.map((it) => ({
-        product_id: it.product.id,
-        quantity: it.quantity,
-      }));
+      sessionStorage.setItem(storageKey, JSON.stringify(currentEnvelope));
+    } catch (e) {}
+    setRestoredEnvelope(currentEnvelope);
+    setIsLoading(true);
+    setAllowManualRetry(false);
 
-      // 2. Tạo khóa Idempotency Key duy nhất (UUIDv4)
-      const idempotencyKey = `ecom-order-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-      // 3. Gửi request tạo đơn hàng sang Backend
-      const res = await orderService.createOrder(
-        {
-          customer_name: formData.customer_name,
-          customer_email: formData.customer_email,
-          customer_phone: formData.customer_phone,
-          shipping_address: formData.shipping_address,
-          note: formData.note,
-          payment_method: paymentMethod,
-          from_cart: false,
-          quote_token: quoteToken,
-          items: orderItems,
-        },
-        idempotencyKey
-      );
-
-      if (res && res.data) {
-        const orderId = res.data.id;
-
-        // Nếu đơn hàng có Flash Sale và trạng thái ban đầu là PENDING (do 2-phase async Saga)
-        if (res.data.order_status === "PENDING" && hasFlashSale) {
-          setIsPolling(true);
-          let finalStatus = "PENDING";
-          for (let attempt = 0; attempt < 8; attempt++) {
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            try {
-              const detail = await orderService.getOrderByID(orderId);
-              if (detail.data && detail.data.order_status) {
-                finalStatus = detail.data.order_status;
-                if (finalStatus === "CONFIRMED") {
-                  break;
-                }
-                if (finalStatus === "CANCELLED") {
-                  setErrorMsg(
-                    "Đơn hàng không thể hoàn tất do sản phẩm Flash Sale hoặc tồn kho thường đã hết suất ưu đãi!"
-                  );
-                  setIsLoading(false);
-                  setIsPolling(false);
-                  return;
-                }
-              }
-            } catch (pollErr) {
-              // Bỏ qua lỗi polling tạm thời và thử lại
-            }
-          }
+    for (let attempt = 0; attempt <= MAX_BACKOFF_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          setRetryStatusText(`Đang thử lại với Idempotency-Key cũ (Lần ${attempt}/${MAX_BACKOFF_RETRIES})...`);
         }
 
-        // 4. Xóa giỏ hàng sau khi đặt thành công
-        clearCart();
-        // 5. Điều hướng sang trang chi tiết đơn hàng
-        router.push(`/orders/${res.data.id}?created=true`);
-      }
-    } catch (err: any) {
-      const isConflict =
-        err.response?.status === 409 ||
-        (err.message &&
-          (err.message.includes("FLASH_SALE_OUT_OF_STOCK") ||
-            err.message.includes("PRICE_CHANGED") ||
-            err.message.includes("FLASH_SALE_QUOTA_EXCEEDED") ||
-            err.message.includes("CONFLICT_REQUOTE_REQUIRED")));
+        const res = await orderService.createOrder(
+          currentEnvelope.payload,
+          currentEnvelope.idempotency_key
+        );
 
-      if (isConflict) {
-        const conflictData: PriceConflictResponse | undefined =
-          err.response?.data?.data || err.response?.data;
-        const msg =
-          conflictData?.message ||
-          err.response?.data?.message ||
-          err.message ||
-          "Một số sản phẩm Flash Sale đã thay đổi giá hoặc hết suất ưu đãi.";
+        if (res && res.data) {
+          currentEnvelope.status = "SUCCESS";
+          try {
+            sessionStorage.removeItem(storageKey);
+          } catch (e) {}
+          setRestoredEnvelope(null);
+          setAllowManualRetry(false);
+          setRetryStatusText(null);
+          idempotencyKeyRef.current = "";
 
-        setConflictInfo({
-          open: true,
-          message: msg,
-          newQuoteToken: conflictData?.new_quote_token,
-          newTotal: conflictData?.new_total,
-          affectedItems: conflictData?.affected_items,
-          newItems: conflictData?.new_items,
-        });
-        setErrorMsg(msg);
-      } else {
-        setErrorMsg(err.message || "Đặt hàng không thành công. Vui lòng thử lại!");
+          const orderId = res.data.id;
+
+          // Nếu đơn hàng có Flash Sale và trạng thái ban đầu là PENDING (do 2-phase async Saga)
+          if (res.data.order_status === "PENDING" && hasFlashSale) {
+            setIsPolling(true);
+            let finalStatus = "PENDING";
+            for (let p = 0; p < 8; p++) {
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              try {
+                const detail = await orderService.getOrderByID(orderId);
+                if (detail.data && detail.data.order_status) {
+                  finalStatus = detail.data.order_status;
+                  if (finalStatus === "CONFIRMED") {
+                    break;
+                  }
+                  if (finalStatus === "CANCELLED") {
+                    setErrorMsg(
+                      "Đơn hàng không thể hoàn tất do sản phẩm Flash Sale hoặc tồn kho thường đã hết suất ưu đãi!"
+                    );
+                    setIsLoading(false);
+                    setIsPolling(false);
+                    return;
+                  }
+                }
+              } catch (pollErr) {
+                // Bỏ qua lỗi polling tạm thời và thử lại
+              }
+            }
+          }
+
+          // Dọn giỏ theo quantity delta snapshot (Mục 6.3)
+          if (isDirectMode) {
+            clearDirectCheckoutDraft();
+          } else {
+            removeSnapshotItems(orderItems);
+          }
+
+          router.push(`/orders/${res.data.id}?created=true`);
+          return;
+        }
+      } catch (err: any) {
+        const status = err.status || err.response?.status;
+        const code = err.code || err.response?.data?.code || "";
+        const msg = err.response?.data?.message || err.message || "";
+
+        // 400 IDEMPOTENCY_KEY_REQUIRED -> Alert, chặn submit
+        if (status === 400 && code === "IDEMPOTENCY_KEY_REQUIRED") {
+          setErrorMsg("Lỗi bảo mật: Yêu cầu thiếu Idempotency-Key. Vui lòng tải lại trang.");
+          try {
+            sessionStorage.removeItem(storageKey);
+          } catch (e) {}
+          setRestoredEnvelope(null);
+          setRetryStatusText(null);
+          setIsLoading(false);
+          return;
+        }
+
+        // 400 IDEMPOTENCY_KEY_MISMATCH -> Yêu cầu refresh để lấy key mới
+        if (status === 400 && code === "IDEMPOTENCY_KEY_MISMATCH") {
+          setErrorMsg("Dữ liệu đơn hàng không khớp với yêu cầu trước đó. Vui lòng làm mới trang để tạo phiên mới.");
+          cancelEnvelopeAndReset();
+          setIsLoading(false);
+          return;
+        }
+
+        // 409 QUOTE_CHANGED / QUOTE_EXPIRED / PRICE_CHANGED / FLASH_SALE_OUT_OF_STOCK
+        const isQuoteConflict =
+          (status === 409 &&
+            (code === "QUOTE_CHANGED" ||
+              code === "QUOTE_EXPIRED" ||
+              code === "CONFLICT_REQUOTE_REQUIRED" ||
+              code === "PRICE_CHANGED")) ||
+          (msg &&
+            (msg.includes("QUOTE_CHANGED") ||
+              msg.includes("PRICE_CHANGED") ||
+              msg.includes("FLASH_SALE_OUT_OF_STOCK") ||
+              msg.includes("FLASH_SALE_QUOTA_EXCEEDED") ||
+              msg.includes("FLASH_SALE_EXPIRED")));
+
+        if (isQuoteConflict) {
+          const conflictData: PriceConflictResponse | undefined =
+            err.response?.data?.data || err.response?.data;
+          const displayMsg =
+            conflictData?.message ||
+            msg ||
+            "Một số sản phẩm Flash Sale đã thay đổi giá hoặc hết suất ưu đãi.";
+
+          setConflictInfo({
+            open: true,
+            message: displayMsg,
+            newQuoteToken: conflictData?.new_quote_token,
+            newTotal: conflictData?.new_total,
+            affectedItems: conflictData?.affected_items,
+            newItems: conflictData?.new_items,
+          });
+          setErrorMsg(displayMsg);
+          setRetryStatusText(null);
+          setIsLoading(false);
+          return;
+        }
+
+        // 409 IDEMPOTENCY_CONFLICT -> Xung đột yêu cầu
+        if (status === 409 && code === "IDEMPOTENCY_CONFLICT") {
+          setErrorMsg("Yêu cầu xung đột với giao dịch đang thực hiện. Vui lòng tạo đơn mới.");
+          cancelEnvelopeAndReset();
+          setIsLoading(false);
+          return;
+        }
+
+        // 503 FLASH_SALE_SERVICE_UNAVAILABLE -> Hệ thống Flash Sale bận
+        if (status === 503 && code === "FLASH_SALE_SERVICE_UNAVAILABLE") {
+          setErrorMsg(
+            "Hệ thống Flash Sale đang bận hoặc gián đoạn kết nối. Bạn có thể bấm 'Kiểm tra lại' (giữ nguyên phiên) hoặc quay lại sau."
+          );
+          setAllowManualRetry(true);
+          setRetryStatusText(null);
+          setIsLoading(false);
+          return;
+        }
+
+        // Kiểm tra điều kiện có thể retry tự động (ORDER_PROCESSING 409, CHECKOUT_OUTCOME_UNKNOWN 503, CHECKOUT_RETRYABLE 503, mạng timeout / lỗi server 5xx)
+        const isRetryable =
+          (status === 409 && code === "ORDER_PROCESSING") ||
+          (status === 503 && (code === "CHECKOUT_OUTCOME_UNKNOWN" || code === "CHECKOUT_RETRYABLE")) ||
+          !status ||
+          status >= 500;
+
+        if (isRetryable && attempt < MAX_BACKOFF_RETRIES) {
+          currentEnvelope.status = "RETRYING";
+          try {
+            sessionStorage.setItem(storageKey, JSON.stringify(currentEnvelope));
+          } catch (e) {}
+          setRestoredEnvelope(currentEnvelope);
+
+          const delayMs = getJitterDelay(BASE_DELAYS_MS[attempt]);
+          setRetryStatusText(
+            `Hệ thống đang xác nhận đơn hàng, tự động thử lại sau ${(delayMs / 1000).toFixed(1)}s (Lần ${attempt + 1}/${MAX_BACKOFF_RETRIES})...`
+          );
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+
+        // Đã hết số lần retry hoặc gặp lỗi không retryable
+        if (isRetryable) {
+          setErrorMsg(
+            "Chưa nhận được phản hồi xác nhận từ máy chủ. Đơn hàng của bạn đã được bảo lưu an toàn. Vui lòng bấm 'Kiểm tra lại' bên dưới để tra cứu với cùng Idempotency-Key."
+          );
+          setAllowManualRetry(true);
+        } else {
+          setErrorMsg(msg || "Đặt hàng không thành công. Vui lòng thử lại!");
+        }
+        setRetryStatusText(null);
+        setIsLoading(false);
+        return;
       }
-    } finally {
-      setIsLoading(false);
-      setIsPolling(false);
     }
+
+    setIsLoading(false);
+    setRetryStatusText(null);
   };
 
-  if (items.length === 0) {
+  const handleCheckout = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeOrderSubmission(restoredEnvelope || undefined);
+  };
+
+  if (checkoutItems.length === 0) {
     return (
       <div className="min-h-[70vh] flex flex-col items-center justify-center px-4 py-16 text-center">
         <div className="w-20 h-20 rounded-3xl bg-blue-50 dark:bg-slate-800 flex items-center justify-center text-blue-600 mb-6 shadow-sm">
           <ShoppingBag className="w-10 h-10" />
         </div>
         <h1 className="text-2xl font-bold text-slate-900 dark:text-white">
-          Giỏ hàng của bạn đang trống
+          {isDirectMode ? "Chưa có thông tin sản phẩm Mua Ngay" : "Giỏ hàng của bạn đang trống"}
         </h1>
         <p className="text-slate-500 max-w-md mt-2 mb-8 text-sm">
-          Bạn chưa có món hàng nào để thanh toán. Hãy tiếp tục dạo xem các sản phẩm điện máy đỉnh cao nhé!
+          {isDirectMode
+            ? "Phiên mua ngay của bạn chưa được khởi tạo hoặc đã hoàn tất. Hãy tiếp tục chọn sản phẩm yêu thích nhé!"
+            : "Bạn chưa có món hàng nào để thanh toán. Hãy tiếp tục dạo xem các sản phẩm điện máy đỉnh cao nhé!"}
         </p>
         <Link href="/products">
           <Button size="lg" className="shadow-lg shadow-blue-500/25 gap-2">
@@ -391,32 +655,16 @@ export default function CheckoutPage() {
                   type="button"
                   variant="outline"
                   className="flex-1 rounded-xl"
-                  onClick={() => router.push("/cart")}
+                  onClick={handleCancelNewQuote}
                 >
-                  Quay lại giỏ hàng
+                  Hủy bỏ (Về giỏ hàng)
                 </Button>
                 <Button
                   type="button"
                   className="flex-1 rounded-xl bg-amber-600 hover:bg-amber-700 text-white shadow-lg shadow-amber-600/25"
-                  onClick={() => {
-                    if (conflictInfo.newQuoteToken) {
-                      setQuoteToken(conflictInfo.newQuoteToken);
-                      if (conflictInfo.newItems && conflictInfo.newTotal !== undefined) {
-                        setActiveQuote({
-                          quote_token: conflictInfo.newQuoteToken,
-                          total: conflictInfo.newTotal,
-                          expires_at: Date.now() + 15 * 60 * 1000,
-                          items: conflictInfo.newItems,
-                        });
-                      }
-                      setQuoteStatus("ready");
-                    }
-                    syncFlashSaleOffers({});
-                    setConflictInfo({ open: false, message: "" });
-                    setErrorMsg(null);
-                  }}
+                  onClick={handleAcceptNewQuote}
                 >
-                  Chấp nhận mua giá thường
+                  Đồng ý mua với giá mới
                 </Button>
               </div>
             </div>
@@ -446,19 +694,90 @@ export default function CheckoutPage() {
           </div>
         </div>
 
-        {errorMsg && (
-          <div className="mb-8 p-4 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/50 rounded-2xl text-red-700 dark:text-red-300 text-sm flex items-start gap-3">
-            <div className="w-2 h-2 rounded-full bg-red-500 mt-2 flex-shrink-0" />
-            <div>
-              <span className="font-bold">Lỗi xử lý đơn hàng:</span> {errorMsg}
-              {errorMsg.includes("đăng nhập") && (
-                <div className="mt-2">
-                  <Link href="/login" className="underline font-semibold text-blue-600 dark:text-blue-400">
-                    Bấm vào đây để đăng nhập ngay &rarr;
-                  </Link>
-                </div>
-              )}
+        {/* Banner khôi phục phiên đặt hàng dở dang */}
+        {restoredEnvelope && (
+          <div className="mb-6 p-4 bg-amber-50 dark:bg-amber-950/50 border border-amber-300 dark:border-amber-800 rounded-2xl flex flex-wrap items-center justify-between gap-3 animate-in fade-in">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-100 dark:bg-amber-900 flex items-center justify-center text-amber-600 dark:text-amber-400">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="font-bold text-amber-900 dark:text-amber-100 text-sm">
+                  Đang tiếp tục đơn hàng trước đó
+                </p>
+                <p className="text-xs text-amber-700 dark:text-amber-300 font-mono">
+                  Idempotency-Key: {restoredEnvelope.idempotency_key}
+                </p>
+              </div>
             </div>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={cancelEnvelopeAndReset}
+                className="text-xs border-amber-300 dark:border-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900"
+              >
+                Hủy / Tạo đơn mới
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => executeOrderSubmission(restoredEnvelope)}
+                disabled={isLoading || isPolling}
+                className="text-xs bg-amber-600 hover:bg-amber-700 text-white shadow-sm"
+              >
+                Kiểm tra lại ngay
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Trạng thái retry backoff */}
+        {retryStatusText && (
+          <div className="mb-6 p-4 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800 rounded-2xl flex items-center gap-3 text-blue-700 dark:text-blue-300 text-sm animate-pulse">
+            <Loader2 className="w-5 h-5 animate-spin flex-shrink-0" />
+            <span>{retryStatusText}</span>
+          </div>
+        )}
+
+        {errorMsg && (
+          <div className="mb-8 p-4 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800/50 rounded-2xl text-red-700 dark:text-red-300 text-sm">
+            <div className="flex items-start gap-3">
+              <div className="w-2 h-2 rounded-full bg-red-500 mt-2 flex-shrink-0" />
+              <div className="flex-1">
+                <span className="font-bold">Lỗi xử lý đơn hàng:</span> {errorMsg}
+                {errorMsg.includes("đăng nhập") && (
+                  <div className="mt-2">
+                    <Link href="/login" className="underline font-semibold text-blue-600 dark:text-blue-400">
+                      Bấm vào đây để đăng nhập ngay &rarr;
+                    </Link>
+                  </div>
+                )}
+              </div>
+            </div>
+            {allowManualRetry && restoredEnvelope && (
+              <div className="mt-4 pt-3 border-t border-red-200 dark:border-red-800/60 flex items-center gap-3">
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => executeOrderSubmission(restoredEnvelope)}
+                  disabled={isLoading || isPolling}
+                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs rounded-xl shadow"
+                >
+                  Kiểm tra lại (Giữ Idempotency-Key)
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={cancelEnvelopeAndReset}
+                  className="text-xs rounded-xl"
+                >
+                  Hủy / Tạo đơn mới
+                </Button>
+              </div>
+            )}
           </div>
         )}
 
@@ -631,7 +950,7 @@ export default function CheckoutPage() {
             <div className="sticky top-24 bg-white dark:bg-slate-900 rounded-3xl p-6 sm:p-8 shadow-sm border border-slate-100 dark:border-slate-800 space-y-6">
               <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
                 <h3 className="text-lg font-bold text-slate-900 dark:text-white">
-                  Đơn hàng của bạn ({activeQuote?.items ? activeQuote.items.length : items.length} món)
+                  Đơn hàng của bạn ({activeQuote?.items ? activeQuote.items.length : checkoutItems.length} món)
                 </h3>
                 <Link href="/products" className="text-xs font-semibold text-blue-600 hover:underline">
                   Thay đổi
@@ -642,7 +961,7 @@ export default function CheckoutPage() {
               <div className="max-h-72 overflow-y-auto space-y-3 pr-1">
                 {activeQuote && activeQuote.items && activeQuote.items.length > 0
                   ? activeQuote.items.map((line) => {
-                      const cartItem = items.find((it) => it.product.id === line.product_id);
+                      const cartItem = checkoutItems.find((it) => it.product.id === line.product_id);
                       const originalPrice = cartItem?.product.price || line.unit_price;
                       const thumbnail = cartItem?.product.thumbnail;
 
@@ -688,7 +1007,7 @@ export default function CheckoutPage() {
                         </div>
                       );
                     })
-                  : items.map(({ product, quantity, isFlashSale, salePrice }) => {
+                  : checkoutItems.map(({ product, quantity, isFlashSale, salePrice }) => {
                       const currentPrice =
                         isFlashSale && salePrice
                           ? salePrice
@@ -751,39 +1070,52 @@ export default function CheckoutPage() {
                       </span>
                     </div>
                     <div className="flex justify-between text-slate-500">
-                      <span className="flex items-center gap-1">
-                        <Truck className="w-3.5 h-3.5 text-emerald-600" /> Phí vận chuyển:
-                      </span>
-                      <span className="font-semibold text-emerald-600">Miễn phí toàn quốc</span>
+                      <span>Phí vận chuyển:</span>
+                      <span className="text-emerald-600 font-semibold">Miễn phí</span>
                     </div>
-                    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex justify-between items-baseline">
-                      <span className="text-base font-bold text-slate-900 dark:text-white">Tổng thanh toán:</span>
-                      <div className="text-right">
-                        <span className="text-2xl font-black text-blue-600 dark:text-blue-400 block">
-                          {formatPrice(finalPayableTotal)}
-                        </span>
-                        <span className="text-[11px] text-slate-400">Đã bao gồm thuế VAT</span>
-                      </div>
+                    <div className="flex justify-between pt-3 border-t border-slate-100 dark:border-slate-800 text-base">
+                      <span className="font-bold text-slate-900 dark:text-white">Tổng thanh toán:</span>
+                      <span className="font-black text-xl text-blue-600">
+                        {formatPrice(finalPayableTotal)}
+                      </span>
                     </div>
                   </div>
                 );
               })()}
 
+              {/* Cam kết / Badge */}
+              <div className="space-y-2.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+                <div className="flex items-center gap-2.5 text-xs text-slate-500">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0" />
+                  <span>Cam kết chính hãng 100% - Bảo hành tận nơi</span>
+                </div>
+                <div className="flex items-center gap-2.5 text-xs text-slate-500">
+                  <Truck className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                  <span>Giao hàng nhanh 2h trong nội thành</span>
+                </div>
+              </div>
+
               {/* Nút Đặt Hàng */}
               <Button
                 type="submit"
                 size="lg"
-                className={`w-full py-4 text-base font-bold tracking-wide shadow-xl ${
-                  effectiveHasFlashSale
-                    ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 shadow-rose-600/25"
-                    : "shadow-blue-500/25"
-                }`}
-                disabled={isLoading || isPolling || quoteStatus !== "ready" || !quoteToken}
+                disabled={isLoading || isPolling || quoteStatus === "loading" || quoteStatus === "error"}
+                className="w-full rounded-2xl h-14 font-black text-base shadow-xl shadow-blue-600/25 transition hover:scale-[1.01] active:scale-[0.99]"
               >
-                {quoteStatus === "loading" ? (
+                {retryStatusText ? (
                   <span className="flex items-center gap-2">
                     <Loader2 className="w-5 h-5 animate-spin" />
-                    Đang tải báo giá...
+                    Đang thử lại đơn hàng...
+                  </span>
+                ) : isLoading ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Đang xử lý đơn hàng...
+                  </span>
+                ) : quoteStatus === "loading" ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Đang tính toán báo giá...
                   </span>
                 ) : quoteStatus === "error" ? (
                   <span className="flex items-center gap-2">
@@ -794,6 +1126,11 @@ export default function CheckoutPage() {
                   <span className="flex items-center gap-2">
                     <Loader2 className="w-5 h-5 animate-spin" />
                     Đang xác nhận giữ chỗ Flash Sale...
+                  </span>
+                ) : allowManualRetry ? (
+                  <span className="flex items-center gap-2">
+                    <Lock className="w-4 h-4" />
+                    ⚡ BẤM ĐỂ KIỂM TRA LẠI ĐƠN HÀNG
                   </span>
                 ) : (
                   <span className="flex items-center gap-2">
@@ -812,5 +1149,19 @@ export default function CheckoutPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+export default function CheckoutPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen flex items-center justify-center bg-slate-50/50 dark:bg-slate-950">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+        </div>
+      }
+    >
+      <CheckoutContent />
+    </Suspense>
   );
 }
